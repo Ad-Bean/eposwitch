@@ -1,0 +1,15 @@
+# build artifacts
+*.exe
+*.o
+*.obj
+*.log
+
+# user config (created at runtime)
+settings.ini
+profiles.txt
+presets.txt
+
+# local junk
+archive/
+screenshots/
+reverse/
