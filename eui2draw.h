@@ -461,8 +461,11 @@ inline void DrawOverview(Graphics& g, AppState& st) {
                 std::wstring n2 = ep.name;
                 if (n2.size() > 22) n2 = n2.substr(0, 21) + L"…";
                 TextLeft(g, dr.X + (REAL)S(46), dr.Y + (REAL)S(5), n2.c_str(), fDev, t.text);
+                std::wstring sub2 = cur ? st.T(L"当前默认输出", L"Current output") : L"";
+                if (ep.kind == KIND_BT && ep.batt >= 0)
+                    sub2 += (sub2.empty() ? L"" : L"  ·  ") + std::to_wstring(ep.batt) + L"%";
                 TextLeft(g, dr.X + (REAL)S(46), dr.Y + (REAL)S(22),
-                         cur ? st.T(L"当前默认输出", L"Current output") : L"", fDevS, t.accent);
+                         sub2.c_str(), fDevS, t.accent);
                 iy += S(46);
             }
         }
@@ -1147,6 +1150,9 @@ inline void DrawDevices(Graphics& g, AppState& st) {
         default:           sub = st.T(L"其他", L"Other"); break;
         }
         if (!ep.fmt.empty()) sub += L"  ·  " + ep.fmt;
+        // 蓝牙耳机：显示电量
+        if (ep.kind == KIND_BT && ep.batt >= 0)
+            sub += L"  ·  电量 " + std::to_wstring(ep.batt) + L"%";
         TextLeft(g, rct.X + (REAL)S(48), rct.Y + (REAL)S(31), sub.c_str(), MakeF(S(11)), t.textDim);
 
         // ---- 右侧：音量条 + 百分比 + 静音（当前默认设备不再占这一块）----

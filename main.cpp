@@ -13,6 +13,7 @@
 #include <propsys.h>
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -54,6 +55,8 @@ struct Endpoint {
   DWORD state = 0;
   DevKind kind = KIND_OTHER;
   std::wstring fmt;      // 例如 "48000 Hz · 2ch · 32bit"（读不到则为空）
+  std::wstring btMac;    // 蓝牙端点的 MAC（12 位十六进制，非蓝牙为空）
+  int batt = -1;         // 蓝牙耳机电量 0..100（-1 = 未知）
 };
 
 #include "eui2.h"
@@ -182,6 +185,73 @@ static DevKind Classify(const std::wstring& name, const std::vector<std::wstring
   return KIND_OTHER;
 }
 
+// 蓝牙耳机电量：Windows 设置页同源数据。
+// 位置：HFP 服务节点（BTHENUM\{0000111E-...}）的容器属性
+//   {104EA319-6EE2-4701-BD47-8DDBF425BBE5} pid 2（DEVPROP_TYPE_BYTE，0..100）
+// 该属性不在公开的 WinRT/属性系统里（System.Devices.BatteryLife 等均为空），
+// 只能从 PnP 层读。全部只读，与官方栈无冲突。
+static void Log(const wchar_t* fmt, ...);
+static const DEVPROPKEY PKEY_BtBattery = { {0x104EA319,0x6EE2,0x4701,{0xBD,0x47,0x8D,0xDB,0xF4,0x25,0xBB,0xE5}}, 2 };
+
+// 从音频端点的实例 ID 提取蓝牙 MAC（形如 ...&0&9881BB113136_C00000000）
+static std::wstring BtMacFromInstanceId(const std::wstring& id) {
+  size_t p = id.find(L"_C00000000");
+  if (p == std::wstring::npos || p < 12) return L"";
+  std::wstring mac = id.substr(p - 12, 12);
+  for (wchar_t c : mac)
+    if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')))
+      return L"";
+  return mac;
+}
+
+// 读指定 MAC 的蓝牙耳机电量（遍历 BTHENUM 节点，HFP 节点上有效）。-1 = 未知
+// 由 MMDevice 接口 ID 取 PnP 实例 ID（CM_Get_Device_Interface_PropertyW）
+static std::wstring InstanceIdOfMmDevice(const std::wstring& mmId) {
+  DEVPROPKEY k = { {0x78c34fc8,0x104a,0x4aca,{0x9e,0xa4,0x52,0x4d,0x52,0x99,0x6e,0x57}}, 256 }; // DEVPKEY_Device_InstanceId
+  DEVPROPTYPE t = 0; ULONG sz = 0;
+  if (CM_Get_Device_Interface_PropertyW(mmId.c_str(), &k, &t, nullptr, &sz, 0) != CR_BUFFER_SMALL || sz == 0)
+    return L"";
+  std::vector<BYTE> b(sz);
+  if (CM_Get_Device_Interface_PropertyW(mmId.c_str(), &k, &t, b.data(), &sz, 0) != CR_SUCCESS)
+    return L"";
+  if (t != DEVPROP_TYPE_STRING) return L"";
+  return std::wstring((wchar_t*)b.data());
+}
+
+static int ReadBtBatteryByMac(const std::wstring& macLower) {
+  static std::wstring (*low)(std::wstring) = nullptr;
+  (void)low;
+  ULONG len = 0;
+  if (CM_Get_Device_ID_List_SizeW(&len, L"BTHENUM", CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS)
+    return -1;
+  std::vector<wchar_t> ids(len);
+  if (CM_Get_Device_ID_ListW(L"BTHENUM", ids.data(), len, CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS)
+    return -1;
+  std::wstring cur;
+  for (const wchar_t* p = ids.data(); ; p++) {
+    if (*p == 0) {
+      if (cur.empty()) break;
+      // 大小写不敏感地匹配 MAC
+      std::wstring lowCur;
+      for (wchar_t c : cur) lowCur.push_back((c >= L'A' && c <= L'Z') ? (wchar_t)(c - L'A' + L'a') : c);
+      if (lowCur.find(macLower) != std::wstring::npos) {
+        DEVINST dn = 0;
+        DEVPROPTYPE t = 0;
+        BYTE b = 0; ULONG sz = sizeof(b);
+        if (CM_Locate_DevNodeW(&dn, cur.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+            CM_Get_DevNode_PropertyW(dn, &PKEY_BtBattery, &t, &b, &sz, 0) == CR_SUCCESS &&
+            t == DEVPROP_TYPE_BYTE && b <= 100) {
+          return (int)b;       // HFP 节点携带电量
+        }
+      }
+      cur.clear();
+      continue;
+    }
+    cur.push_back(*p);
+  }
+  return -1;
+}
+
 // ---------------- Core Audio 封装 ----------------
 // --mic=子串：指定麦克风测试用哪个采集设备（AudioCore 里要用，先声明）
 static std::wstring g_micNameFilter;
@@ -224,7 +294,14 @@ public:
       if (SUCCEEDED(dev->GetId(&id))) { ep.id = id; CoTaskMemFree(id); }
       dev->GetState(&ep.state);
       IPropertyStore* ps = nullptr;
+      std::wstring epInstanceId;
       if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) {
+        // PKEY_AudioEndpoint 系列 pid2：含完整 PnP 实例路径（...&0&<MAC>_C00000000）
+        PROPERTYKEY kPath = { {0xb3f8fa53,0x0004,0x438e,{0x90,0x03,0x51,0xa4,0x6e,0x13,0x9b,0xfc}}, 2 };
+        PROPVARIANT pvI; PropVariantInit(&pvI);
+        if (SUCCEEDED(ps->GetValue(kPath, &pvI)) && pvI.vt == VT_LPWSTR)
+          epInstanceId = pvI.pwszVal;
+        PropVariantClear(&pvI);
         PROPVARIANT pv; PropVariantInit(&pv);
         if (SUCCEEDED(ps->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
           ep.name = pv.pwszVal;
@@ -233,6 +310,15 @@ public:
       }
       ep.kind = Classify(ep.name, btNames);
       ep.fmt = MixFormatOf(dev);
+      // 蓝牙端点：提取 MAC 并读电量（Windows 设置页同源数据）
+      if (epInstanceId.find(L"BTHENUM") != std::wstring::npos) {
+        ep.btMac = BtMacFromInstanceId(epInstanceId);
+        if (!ep.btMac.empty()) {
+          std::wstring lowMac = ep.btMac;
+          for (wchar_t& c : lowMac) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+          ep.batt = ReadBtBatteryByMac(lowMac);
+        }
+      }
       out.push_back(ep);
       dev->Release();
     }

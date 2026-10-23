@@ -22,6 +22,9 @@ executable, no installer, no driver, no runtime dependencies.
   interface (read-only; press the ANC key once to sync). See *How it works*.
 - **Global hotkeys** — configurable/rebindable (cycle output, mute, cycle EQ preset),
   with a master on/off switch.
+- **Bluetooth battery** — headset battery % read from the HFP device node
+  (same source as the Windows Settings page; works for classic-BT headsets
+  that don't expose GATT).
 - **Extras** — low-battery notifications, auto-switch on headset connect, restore on
   reconnect, autostart, tray mode, Chinese/English UI, crash logging.
 
@@ -32,7 +35,7 @@ MinGW-w64 (GCC 13+ tested with 15.2):
 ```bat
 windres app.rc -O coff -o app_res.o
 g++ -std=c++17 -O2 -municode -mwindows -s -static -o eposwitch.exe main.cpp app_res.o ^
-    -lgdiplus -lole32 -luuid -loleaut32 -lshlwapi -lwinmm -lversion -lcomdlg32 -lsetupapi -lhid
+    -lgdiplus -lole32 -luuid -loleaut32 -lshlwapi -lwinmm -lversion -lcomdlg32 -lsetupapi -lhid -lcfgmgr32
 ```
 
 The result is a single ~1.4 MB `eposwitch.exe` with no external dependencies.
