@@ -48,27 +48,22 @@ inline void DrawSidebar(Graphics& g, AppState& st) {
     Pen sep(t.border, 1.0f);
     g.DrawLine(&sep, navW, 0, navW, m.h);
 
-    // 应用标识
+    // 应用标识（通用音频面板，不再绑定 EPOS 品牌）
     RectF logo((REAL)S(16), (REAL)S(16), (REAL)S(28), (REAL)S(28));
     FillRound(g, logo, (REAL)9, t.accent);
     Font fLogo = MakeF(S(13), true);
-    TextCenter(g, logo, L"E", fLogo, Color(255, 255, 255, 255));
+    TextCenter(g, logo, L"♪", fLogo, Color(255, 255, 255, 255));
     Font fApp = MakeF(S(13), true);
-    TextLeft(g, S(52), S(22), st.T(L"EPOS 控制", L"EPOS Control"), fApp, t.text);
+    TextLeft(g, S(52), S(22), st.T(L"音频控制台", L"Audio Console"), fApp, t.text);
 
-    // 导航项
+    // 导航项（动态：EPOS 专属页只在设备在线时出现）
     int y = L.navTop;
     Font fNav = MakeF(S(13));
-    // ★ 必须和 NavCount() 一致：之前只有 5 个元素但导航变成 6 项，
-    //   第 6 项越界读取图标 id 直接导致启动崩溃（0xC0000005）。
-    static const IconId kNavIcon[8] = {
-        ICON_HEADSET, ICON_EQ, ICON_MIC, ICON_SPEAKER,
-        ICON_VOLUME, ICON_PRESET, ICON_CHIP, ICON_SLIDERS
-    };
-    static_assert(sizeof(kNavIcon) / sizeof(kNavIcon[0]) == 8, "nav icon count");
-    for (int i = 0; i < NavCount(); i++) {
+    int navN = NavVisibleCount(st);
+    for (int i = 0; i < navN; i++) {
+        const NavDef& nv = NavAt(st, i);
         RectF r((REAL)S(10), (REAL)y, (REAL)(navW - S(20)), (REAL)L.navItemBoxH);
-        bool sel = (st.page == Navs()[i].page);
+        bool sel = (st.page == nv.page);
         bool hov = (st.hoverId == CID_PAGE_BASE + i);
         if (sel) {
             FillRound(g, r, (REAL)8, t.accentSoft);
@@ -80,58 +75,78 @@ inline void DrawSidebar(Graphics& g, AppState& st) {
             RectF ind(r.X, r.Y + (REAL)10, (REAL)3, r.Height - (REAL)20);
             FillRound(g, ind, (REAL)1.5f, t.borderHi);
         }
-        // 矢量图标（替代原来的纯色方块）
+        // 矢量图标（图标 id 跟着 NavDef 走，不会再有数组越界）
         RectF ic(r.X + (REAL)S(11), r.Y + (REAL)((L.navItemBoxH - S(18)) / 2),
                  (REAL)S(18), (REAL)S(18));
-        DrawIcon(g, ic, kNavIcon[i], sel ? t.accent : (hov ? t.text : t.textDim));
+        DrawIcon(g, ic, (IconId)nv.icon, sel ? t.accent : (hov ? t.text : t.textDim));
         TextLeftVC(g, RectF(r.X, r.Y, r.Width - (REAL)S(8), r.Height),
-                   st.T(Navs()[i].zh, Navs()[i].en), fNav,
+                   st.T(nv.zh, nv.en), fNav,
                    sel ? t.text : (hov ? t.text : t.textDim),
                    (REAL)S(38));
         y += L.navItemH;
     }
 
-    // ---- 底部设置卡片（语言）----
-    // 做成一张卡片，语言下拉左右内边距与导航项一致，视觉上不再"偏"
+    // ---- 底部一行：左"服务状态"，右语言图标按钮 ----
     RectF foot((REAL)L.footX, (REAL)L.footY, (REAL)L.footW, (REAL)L.footH);
-    FillRound(g, foot, (REAL)8, t.surface);
-    StrokeRound(g, foot, (REAL)8, t.border, 1.0f);
 
-    Font fFootLbl = MakeF(S(10));
-    TextLeft(g, foot.X + (REAL)S(12), foot.Y + (REAL)S(9),
-             st.T(L"语言", L"Language"), fFootLbl, t.textFaint);
+    // ---- 左下角信息行：EPOS 在线显示耳机，否则显示系统默认输出 ----
+    // （顶栏不再放设备选择器 —— 通用面板不该被某款耳机占用顶部空间）
+    {
+        std::wstring line;
+        bool epos = st.eposOnline && !st.devices.empty();
+        const eposdev::DeviceInfo* d = nullptr;
+        if (epos) {
+            int idx = (st.selectedDevice >= 0 && st.selectedDevice < (int)st.devices.size())
+                        ? st.selectedDevice : 0;
+            d = &st.devices[idx];
+        }
+        if (d) {
+            std::wstring nm = d->deviceDisplayName.empty() ? L"EPOS" : d->deviceDisplayName;
+            line = nm + ((d->hsConnection == L"Dongle") ? L" · 2.4G" : L" · BT");
+        } else {
+            line = st.T(L"输出: ", L"Out: ");
+            if (st.endpoints)
+                for (const auto& ep : *st.endpoints)
+                    if (ep.id == st.currentOutputId) { line += ep.name; break; }
+        }
+        if (line.size() > 24) line = line.substr(0, 23) + L"…";
+        bool hovOut = (st.hoverId == CID_ACTION && st.actionHint == ACT_GOTO_DEV);
+        Font fOut = MakeF(S(10));
+        REAL tx = foot.X + (REAL)S(2);
+        if (d) {
+            // 连接状态点（2.4G 绿 / 蓝牙黄）
+            // 文字视觉中心实测在 outY+8.5（10px 字体），点跟着文字走
+            Dot(g, foot.X + (REAL)S(6), (REAL)(L.outY + S(8)) + (REAL)0.5f, (REAL)S(3),
+                (d->hsConnection == L"Dongle") ? t.success : t.warn);
+            tx = foot.X + (REAL)S(14);
+        }
+        TextLeft(g, tx, (REAL)L.outY, line.c_str(), fOut,
+                 (hovOut || d) ? t.text : t.textDim);
+    }
 
-    // 语言：下拉列表（收起态显示当前语言 + 箭头）
+    // 左：连接状态
+    {
+        Font fSm = MakeF(S(10));
+        REAL cy = foot.Y + foot.Height / 2;
+        // ★ Dot 收的是圆心坐标；实测文字中心正好等于行中心 cy
+        Dot(g, foot.X + (REAL)S(5), cy, (REAL)S(3),
+            st.pipeReady ? t.success : t.warn);
+        TextLeft(g, foot.X + (REAL)S(13), cy - (REAL)S(7),
+                 st.pipeReady ? st.T(L"服务已连接", L"Service connected")
+                              : st.T(L"服务未连接", L"Service offline"),
+                 fSm, st.pipeReady ? t.success : t.warn);
+    }
+
+    // 右：语言图标按钮（点开向上弹出语言列表）
     {
         RectF cb((REAL)L.langX, (REAL)L.langY, (REAL)L.langW, (REAL)L.langH);
         bool open = st.langOpen;
         bool hov = (st.hoverId == CID_ACTION && st.actionHint == ACT_LANG) || open;
         FillRound(g, cb, (REAL)7, open ? t.surfaceHi : (hov ? t.surfaceHi : t.bg));
-        StrokeRound(g, cb, (REAL)7, open ? t.accent : t.border, 1.0f);
-        Font fCur = MakeF(S(12));
-        TextLeftVC(g, RectF(cb.X + (REAL)S(10), cb.Y, cb.Width - (REAL)S(28), cb.Height),
-                   st.english ? L"English" : L"中文", fCur, t.text);
-        REAL ax = cb.X + cb.Width - (REAL)S(14), ay = cb.Y + cb.Height / 2;
-        if (open) {
-            Pen pen(t.accent, 1.4f);
-            pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
-            g.DrawLine(&pen, ax - (REAL)S(3), ay + (REAL)S(1.5f), ax, ay - (REAL)S(1.5f));
-            g.DrawLine(&pen, ax, ay - (REAL)S(1.5f), ax + (REAL)S(3), ay + (REAL)S(1.5f));
-        } else {
-            RectF ico(ax - (REAL)S(8), ay - (REAL)S(8), (REAL)S(16), (REAL)S(16));
-            DrawIcon(g, ico, ICON_CHEVRON_DOWN, t.textDim);
-        }
+        StrokeRound(g, cb, (REAL)7, open ? t.accent : (hov ? t.borderHi : t.border), 1.0f);
+        DrawIcon(g, RectF(cb.X + (REAL)S(9), cb.Y + (REAL)S(6), (REAL)S(16), (REAL)S(16)),
+                 ICON_LANG, open ? t.accent : (hov ? t.text : t.textDim));
     }
-
-    // 连接状态（卡片下方）
-    Font fSm = MakeF(S(10));
-    RectF dotR((REAL)(foot.X + S(12)), (REAL)(foot.Y - S(18)), (REAL)S(8), (REAL)S(8));
-    Dot(g, dotR.X + S(3), dotR.Y + S(3), (REAL)S(3),
-        st.pipeReady ? t.success : t.warn);
-    TextLeft(g, foot.X + (REAL)S(22), foot.Y - (REAL)S(23),
-             st.pipeReady ? st.T(L"服务已连接", L"Service connected")
-                          : st.T(L"服务未连接", L"Service offline"),
-             fSm, st.pipeReady ? t.success : t.warn);
 }
 
 // ---------------- 语言下拉浮层（最后画，盖在一切之上）----------------
@@ -143,7 +158,8 @@ inline void DrawLangPopup(Graphics& g, AppState& st) {
     const Theme& t = eui::T();
     Layout L = ComputeLayout(st);
 
-    RectF pr((REAL)L.langX, (REAL)L.langPopY, (REAL)L.langW, (REAL)L.langPopH);
+    // 弹层宽度 = 整条底部（langX/langW 现在只是右侧小按钮）
+    RectF pr((REAL)L.footX, (REAL)L.langPopY, (REAL)L.footW, (REAL)L.langPopH);
     // 阴影感：先画一层稍大的深色圆角
     RectF sh(pr.X - 1, pr.Y + 2, pr.Width + 2, pr.Height + 3);
     FillRound(g, sh, (REAL)9, Color(90, 0, 0, 0));
@@ -190,60 +206,15 @@ inline void DrawTopBar(Graphics& g, AppState& st) {
     if (st.selectedDevice >= 0 && st.selectedDevice < (int)st.devices.size())
         dev = &st.devices[st.selectedDevice];
 
-    // ---- 设备选择器 ----
-    Font fSel = MakeF(S(13), true);
-    Font fSub = MakeF(S(11));
-    RectF sel((REAL)L.devSelX, (REAL)L.devSelY, (REAL)L.devSelW, (REAL)L.devSelH);
-    bool hov = (st.hoverId == CID_DEV_SELECT);
-    FillRound(g, sel, (REAL)8, hov ? t.surfaceHi : t.surface);
-    StrokeRound(g, sel, (REAL)8, t.border, 1.0f);
+    // ---- 设备信息已移到侧栏左下角（见 DrawSidebar 底部）----
+    // 顶栏只留页面标题：这是通用音频面板，不该被某款耳机占一块位置。
 
-    Color dotc = t.textFaint;
-    if (dev) dotc = (dev->hsConnection == L"Dongle") ? t.success : t.warn;
-    Dot(g, sel.X + (REAL)S(16), sel.Y + sel.Height / 2, (REAL)S(4), dotc);
-
-    const wchar_t* nm = L"";
-    if (dev) {
-        if (dev->IsHeadset())
-            nm = dev->deviceDisplayName.empty() ? L"EPOS H3PRO" : dev->deviceDisplayName.c_str();
-        else
-            nm = st.T(L"接收器（耳机离线）", L"Dongle (headset offline)");
-    } else {
-        nm = st.T(L"未检测到设备", L"No device");
-    }
-    // 名称在左，连接方式在右（同一行，不重叠）
-    TextLeft(g, sel.X + (REAL)S(28), sel.Y + (REAL)S(5), nm, fSel, t.text);
-
-    const wchar_t* conn = L"—";
-    if (dev) {
-        if (dev->IsHeadset()) conn = (dev->hsConnection == L"Dongle") ? L"2.4 GHz" : L"BT";
-        else conn = L"USB";
-    }
-    {
-        StringFormat sf; sf.SetAlignment(StringAlignmentFar); sf.SetLineAlignment(StringAlignmentNear);
-        SolidBrush b(t.textDim);
-        // 右侧给下拉箭头留出 S(26) 的空隙，否则 "2.4 GHz" 会和箭头粘在一起
-        RectF vr(sel.X + (REAL)S(90), sel.Y + (REAL)S(8), sel.Width - (REAL)S(126), (REAL)16);
-        g.DrawString(conn, -1, &fSub, vr, &sf, (Brush*)&b);
-    }
-    // 下拉箭头
-    {
-        Pen pen(t.textDim, 1.4f);
-        pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
-        REAL ax = sel.X + sel.Width - (REAL)S(16), ay = sel.Y + sel.Height / 2;
-        g.DrawLine(&pen, ax - (REAL)S(3), ay - (REAL)S(1.5f), ax, ay + (REAL)S(1.5f));
-        g.DrawLine(&pen, ax, ay + (REAL)S(1.5f), ax + (REAL)S(3), ay - (REAL)S(1.5f));
-    }
 
     // ---- 页面标题 ----
-    int titleX = x + S(228);
+    int titleX = x;
     Font fTitle = MakeF(S(16), true);
-    const wchar_t* titles[8] = {
-        st.T(L"总览", L"Overview"), st.T(L"声音", L"Sound"), st.T(L"麦克风", L"Microphone"),
-        st.T(L"设备", L"Devices"), st.T(L"混音器", L"Mixer"), st.T(L"应用", L"App rules"),
-        st.T(L"固件", L"Firmware"), st.T(L"设置", L"Settings")
-    };
-    TextLeft(g, (REAL)titleX, (REAL)S(18), titles[st.page], fTitle, t.text);
+    const NavDef* nd = NavByPage(st, st.page);
+    TextLeft(g, (REAL)titleX, (REAL)S(18), st.T(nd->zh, nd->en), fTitle, t.text);
 
     // ---- 右上角关闭按钮 ----
     {
@@ -314,19 +285,41 @@ inline void DrawOverview(Graphics& g, AppState& st) {
     // ---- 指标卡 ----
     struct Tile { const wchar_t* label; std::wstring value; Color vc; };
     std::vector<Tile> tiles;
-    tiles.push_back({ st.T(L"电量", L"Battery"),
-                      dev && dev->battery >= 0 ? (std::to_wstring(dev->battery) + L"%") : L"—",
-                      (dev && dev->battery >= 0 && dev->battery <= 20) ? t.danger : t.text });
-    tiles.push_back({ st.T(L"降噪", L"Noise reduction"), NoiseReductionText(st, dev), t.text });
-    tiles.push_back({ st.T(L"耳机固件", L"Headset firmware"),
-                      dev && dev->IsHeadset() && !dev->firmwareVersion.empty()
-                        ? dev->firmwareVersion
-                        : (dev && dev->IsDongle() ? st.T(L"耳机离线", L"Offline") : L"—"), t.text });
-    tiles.push_back({ st.T(L"播放延迟", L"Playback latency"),
-                      dev ? (dev->latencyLevel == 1 ? st.T(L"低延迟", L"Low")
-                           : dev->latencyLevel == 2 ? st.T(L"稳定", L"Stable")
-                           : dev->latencyLevel >= 0 ? st.T(L"标准", L"Standard")
-                           : st.T(L"不支持", L"N/A")) : L"—", t.text });
+    if (st.eposOnline) {
+        tiles.push_back({ st.T(L"电量", L"Battery"),
+                          dev && dev->battery >= 0 ? (std::to_wstring(dev->battery) + L"%") : L"—",
+                          (dev && dev->battery >= 0 && dev->battery <= 20) ? t.danger : t.text });
+        tiles.push_back({ st.T(L"降噪", L"Noise reduction"), NoiseReductionText(st, dev), t.text });
+        tiles.push_back({ st.T(L"耳机固件", L"Headset firmware"),
+                          dev && dev->IsHeadset() && !dev->firmwareVersion.empty()
+                            ? dev->firmwareVersion
+                            : (dev && dev->IsDongle() ? st.T(L"耳机离线", L"Offline") : L"—"), t.text });
+        tiles.push_back({ st.T(L"播放延迟", L"Playback latency"),
+                          dev ? (dev->latencyLevel == 1 ? st.T(L"低延迟", L"Low")
+                               : dev->latencyLevel == 2 ? st.T(L"稳定", L"Stable")
+                               : dev->latencyLevel >= 0 ? st.T(L"标准", L"Standard")
+                               : st.T(L"不支持", L"N/A")) : L"—", t.text });
+    } else {
+        // 通用模式：统计卡换成所有用户都关心的系统指标
+        std::wstring btBatt = L"—";
+        int outN = 0, inN = 0;
+        std::wstring outFmt = L"—";
+        if (st.endpoints) {
+            for (const auto& ep : *st.endpoints) {
+                outN++;
+                if (ep.kind == KIND_BT && ep.batt >= 0)
+                    btBatt = std::to_wstring(ep.batt) + L"%";
+                if (ep.id == st.currentOutputId && !ep.fmt.empty()) outFmt = ep.fmt;
+            }
+        }
+        if (st.captureEndpoints) inN = (int)st.captureEndpoints->size();
+        tiles.push_back({ st.T(L"蓝牙电量", L"BT battery"), btBatt,
+                          btBatt != L"—" && btBatt <= L"20%" ? t.danger : t.text });
+        tiles.push_back({ st.T(L"播放设备", L"Playback devs"), std::to_wstring(outN), t.text });
+        tiles.push_back({ st.T(L"录音设备", L"Recording devs"), std::to_wstring(inN), t.text });
+        if (outFmt.size() > 11) outFmt = outFmt.substr(0, 10) + L"…";
+        tiles.push_back({ st.T(L"输出格式", L"Output format"), outFmt, t.text });
+    }
 
     Font fTileL = MakeF(S(11));
     Font fTileV = MakeF(S(18), true);
@@ -485,16 +478,17 @@ inline void DrawOverview(Graphics& g, AppState& st) {
         }
     }
 
-    // 右：耳机状态
+    // 右：设备状态（EPOS 在线 → 耳机状态；否则 → 系统默认设备）
     RectF pr((REAL)(L.contentX + colW + gap), (REAL)L.ovPanelY, (REAL)colW, (REAL)L.ovPanelH);
     FillRound(g, pr, (REAL)10, t.surface);
     StrokeRound(g, pr, (REAL)10, t.border, 1.0f);
     TextLeft(g, pr.X + (REAL)S(14), pr.Y + (REAL)S(14),
-             st.T(L"耳机状态", L"Headset status"), fPanel, t.text);
+             st.eposOnline ? st.T(L"耳机状态", L"Headset status")
+                           : st.T(L"系统默认设备", L"System defaults"), fPanel, t.text);
 
     struct Row { const wchar_t* label; std::wstring value; };
     std::vector<Row> rows;
-    if (dev && dev->IsHeadset()) {
+    if (st.eposOnline && dev && dev->IsHeadset()) {
         // ★ ANC：dongle HID 会上报按键状态（只读监听），未按键前显示"待同步"
         std::wstring anc;
         if (st.ancState == 1)      anc = st.T(L"开（耳机端）", L"On (headset)");
@@ -508,12 +502,28 @@ inline void DrawOverview(Graphics& g, AppState& st) {
                          (dev->hsConnection == L"Dongle") ? L"2.4 GHz" : st.T(L"蓝牙", L"Bluetooth") });
         rows.push_back({ st.T(L"固件", L"Firmware"),
                          dev->firmwareVersion.empty() ? L"—" : dev->firmwareVersion });
-    } else if (dev && dev->IsDongle()) {
+    } else if (st.eposOnline && dev && dev->IsDongle()) {
         rows.push_back({ st.T(L"降噪", L"Noise reduction"), st.T(L"耳机离线", L"Headset offline") });
         rows.push_back({ st.T(L"接收器固件", L"Dongle firmware"),
                          dev->firmwareVersion.empty() ? L"—" : dev->firmwareVersion });
     } else {
-        rows.push_back({ st.T(L"状态", L"Status"), st.T(L"未检测到耳机", L"No headset found") });
+        // 通用模式：列出系统默认输出 / 输入 —— 这是所有用户都关心的
+        std::wstring outName = L"—", inName = L"—";
+        if (st.endpoints)
+            for (const auto& ep : *st.endpoints)
+                if (ep.id == st.currentOutputId) { outName = ep.name; break; }
+        if (st.captureEndpoints)
+            for (const auto& ep : *st.captureEndpoints)
+                if (ep.id == st.currentInputId) { inName = ep.name; break; }
+        if (outName.size() > 34) outName = outName.substr(0, 33) + L"…";
+        if (inName.size() > 34)  inName  = inName.substr(0, 33) + L"…";
+        rows.push_back({ st.T(L"模式", L"Mode"),
+                         st.T(L"通用音频控制", L"Generic audio control") });
+        rows.push_back({ st.T(L"默认输出", L"Default output"), outName });
+        rows.push_back({ st.T(L"默认输入", L"Default input"), inName });
+        rows.push_back({ st.T(L"提示", L"Tip"),
+                         st.T(L"连接 EPOS 耳机后解锁 EQ / 效果控制",
+                              L"Connect an EPOS headset for EQ / effects") });
     }
     Font fRowL = MakeF(S(12));
     Font fRowV = MakeF(S(12), true);
@@ -522,6 +532,32 @@ inline void DrawOverview(Graphics& g, AppState& st) {
         KeyValueRow(g, pr.X + (REAL)S(10), (REAL)ry, (REAL)(colW - S(20)), (REAL)S(28),
                     rows[i].label, rows[i].value, fRowL, fRowV, (i % 2) == 0);
         ry += S(28);
+    }
+    // 降噪的"状态来源 + 最后同步时间"：让用户能判断这是实时值还是旧值
+    if (st.eposOnline && dev && dev->IsHeadset()) {
+        std::wstring note;
+        if (st.ancAt == 0) {
+            note = st.T(L"按一下耳机 ANC 键即可同步", L"Press the headset ANC key to sync");
+        } else if (st.ancAt == 1) {
+            // 1 是哨兵：状态来自 settings.ini（上次运行拨过），不是本次实时同步
+            note = st.T(L"降噪状态：上次已知，拨动滑块即刷新",
+                        L"ANC state: last known — toggle the slider to refresh");
+        } else {
+            DWORD age = (GetTickCount() - st.ancAt) / 1000;
+            if (age < 5) note = st.T(L"降噪状态：刚刚同步", L"ANC state: synced just now");
+            else if (age < 60) note = st.T(L"降噪状态：%d 秒前同步", L"ANC state: synced %ds ago");
+            else note = st.T(L"降噪状态：%d 分钟前同步", L"ANC state: synced %dm ago");
+            if (age >= 5 && age < 60) {
+                wchar_t b[96];
+                swprintf(b, 96, note.c_str(), (int)age);
+                note = b;
+            } else if (age >= 60) {
+                wchar_t b[96];
+                swprintf(b, 96, note.c_str(), (int)(age / 60));
+                note = b;
+            }
+        }
+        TextLeft(g, pr.X + (REAL)S(12), (REAL)(ry + S(2)), note.c_str(), MakeF(S(10)), t.textFaint);
     }
 
     st.contentHeight = (float)(L.ovPanelY + L.ovPanelH - L.contentTop + S(24));
@@ -554,7 +590,9 @@ inline void DrawSound(Graphics& g, AppState& st) {
                  (REAL)(L.presetGridY + r * (L.presetCardH + S(m.gutter))),
                  (REAL)L.presetCardW, (REAL)L.presetCardH);
         bool sel = (i == st.currentPreset);
-        bool hov = (st.hoverId == CID_PRESET_BASE + i);
+        // ★ 命中返回的是 CID_PRESET_BASE + hoverIndex（不带序号的 id），
+        //   这里必须用 hoverIndex 判断，否则永远只高亮第 0 张卡。
+        bool hov = (st.hoverId == CID_PRESET_BASE && st.hoverIndex == i);
         Card(g, cr, hov && !sel, sel);
         const eposfx::Preset& p = st.presets[i];
         TextLeft(g, cr.X + (REAL)S(12), cr.Y + (REAL)S(9),
@@ -577,6 +615,16 @@ inline void DrawSound(Graphics& g, AppState& st) {
                 g.DrawLine(&sp, px, py, nx, ny);
                 px = nx; py = ny;
             }
+        }
+        // 自定义预设：右上角 ×（点了删除）
+        if (!p.builtin) {
+            RectF xx(cr.X + cr.Width - (REAL)S(22), cr.Y + (REAL)S(4),
+                     (REAL)S(18), (REAL)S(18));
+            bool xhov = (st.hoverId == CID_PRESET_DEL && st.hoverIndex == i);
+            if (xhov) FillRound(g, xx, (REAL)5, t.surfaceHi);
+            DrawIcon(g, RectF(xx.X + (REAL)S(2), xx.Y + (REAL)S(2),
+                              (REAL)S(14), (REAL)S(14)),
+                     ICON_CLOSE, xhov ? t.danger : t.textFaint);
         }
     }
 
@@ -614,7 +662,7 @@ inline void DrawSound(Graphics& g, AppState& st) {
     for (int b = 0; b < 9; b++) {
         REAL cx = plotX + bandW * (b + 0.5f);
         REAL cy = mid - (REAL)(st.sound.speakerEq[b] / 6.0 * (h / 2));
-        bool act = (st.hoverId == CID_EQ_BASE + b && st.scroll.dragging);
+        bool act = (st.hoverId == CID_EQ_BASE && st.hoverIndex == b && st.scroll.dragging);
         Dot(g, cx, cy, (REAL)S(4.5), act ? Color(255,255,255,255) : t.accent);
         static const wchar_t* kF[9] = { L"32", L"64", L"125", L"250", L"500", L"1K", L"2K", L"4K", L"8K" };
         StringFormat cf; cf.SetAlignment(StringAlignmentCenter);
@@ -807,7 +855,8 @@ inline void DrawMic(Graphics& g, AppState& st) {
             RectF cr((REAL)(L.contentX + i * (cw + S(8))), (REAL)L.micPresetY,
                      (REAL)cw, (REAL)L.micPresetH);
             bool sel = (st.micPresetIdx == i);
-            bool hov = (st.hoverId == CID_MIC_PRESET_BASE + i);
+            bool hov = (st.hoverId == CID_ACTION && st.actionHint == ACT_MIC_PRESET &&
+                        st.hoverIndex == i);
             FillRound(g, cr, (REAL)6, sel ? t.accentSoft : (hov ? t.surfaceHi : t.surface));
             StrokeRound(g, cr, (REAL)6, sel ? t.accent : t.border, sel ? 1.4f : 1.0f);
             TextCenter(g, cr, st.T(ps[i].zh, ps[i].en), fChip, sel ? t.text : t.textDim);
@@ -1483,7 +1532,7 @@ inline void DrawSettings(Graphics& g, AppState& st) {
         const wchar_t* hzh; const wchar_t* hen;
         bool val;
     };
-    Row rows[7] = {
+    Row rows[8] = {
         { L"开机自动启动", L"Launch at sign-in",
           L"登录 Windows 后自动在托盘运行", L"Start silently in the tray after you sign in",
           st.setAutostart },
@@ -1505,13 +1554,17 @@ inline void DrawSettings(Graphics& g, AppState& st) {
         { L"启用全局快捷键", L"Global hotkeys",
           L"关掉后所有组合键都不再注册，不占用系统热键", L"Turn off to release all hotkeys back to Windows",
           st.setHotkeys },
+        { L"音量浮层提示", L"Volume overlay",
+          L"调音量时在右下角弹出提示；Windows 自带的已够用，可关",
+          L"Show a card in the corner when volume changes; Windows already has one",
+          st.setVolOsd },
     };
 
-    bool values[7] = { st.setAutostart, st.setCloseToTray, st.setAutoSwitch,
+    bool values[8] = { st.setAutostart, st.setCloseToTray, st.setAutoSwitch,
                        st.setAutoRestore, st.setBattAlert, st.setAppPreset,
-                       st.setHotkeys };
+                       st.setHotkeys, st.setVolOsd };
 
-    for (int k = 0; k < L.setN && k < 7; k++) {
+    for (int k = 0; k < L.setN && k < 8; k++) {
         int ry = L.setY + k * L.setRowH;
         bool hov = (st.hoverId == CID_ACTION && st.actionHint == ACT_SET_TOGGLE &&
                     st.hoverIndex == k);

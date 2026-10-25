@@ -8,6 +8,7 @@
 #include <thread>
 #include <mutex>
 #include <deque>
+#include <bitset>
 #include <atomic>
 #include <vector>
 #include <sstream>
@@ -361,10 +362,33 @@ private:
                             if (d.deviceType == 3) hs = true;
                             if (d.deviceType == 5) dg = true;
                         }
-                        m_headsetPresent = hs;
-                        m_donglePresent  = dg;
-                        std::lock_guard<std::mutex> g(m_mu);
-                        m_devices = list;
+                        // ★ 防抖：耳机刚还在、这份快照却没有耳机 → 大概率是服务在耳机
+                        //   连接/切换过程中的瞬时快照（实测会在 6 秒轮询里来回翻转，
+                        //   表现为左侧导航页鬼畜闪烁）。10 秒内的"降级快照"直接丢弃。
+                        const DWORD now = ::GetTickCount();
+                        if (!hs && m_headsetPresent.load() &&
+                            (now - m_lastHeadsetTick) < 10000) {
+                            // 丢弃这份快照，保留上一份（含耳机）
+                        } else {
+                            if (hs) m_lastHeadsetTick = now;
+                            m_headsetPresent = hs;
+                            m_donglePresent  = dg;
+                            std::lock_guard<std::mutex> g(m_mu);
+                            m_devices = list;
+                        }
+                    }
+                }
+                // ★ 记下未见过的 messageType：智能按钮之类的事件如果走管道，
+                //   会以新 messageType 出现（只记一次，避免刷屏）。
+                {
+                    size_t p = msg.find("\"messageType\":\"");
+                    if (p != std::string::npos) {
+                        int mt = atoi(msg.c_str() + p + 15);
+                        if (mt > 0 && !m_seenTypes.test(mt % 64)) {
+                            m_seenTypes.set(mt % 64);
+                            extern void PipeNewTypeLog(int);
+                            PipeNewTypeLog(mt);
+                        }
                     }
                 }
                 {
@@ -388,6 +412,8 @@ private:
     std::atomic<bool> m_headsetPresent{false};
     std::atomic<bool> m_donglePresent{false};
     std::atomic<bool> m_stop{false};
+    DWORD m_lastHeadsetTick = 0;      // 最近一次"含耳机"的设备列表时间（防抖用）
+    std::bitset<64> m_seenTypes;      // 已见过的 messageType（避免重复打日志）
 };
 
 }  // namespace epospipe

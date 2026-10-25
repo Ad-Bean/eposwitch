@@ -19,7 +19,10 @@ executable, no installer, no driver, no runtime dependencies.
 - **Per-app EQ presets** — rules like `cs2.exe = ESPORT` automatically switch presets
   when a game comes to the foreground (editable in-app, stored in `profiles.txt`).
 - **Live ANC state** — reads the headset's ANC on/off through the dongle's vendor HID
-  interface (read-only; press the ANC key once to sync). See *How it works*.
+  interface (read-only; toggle the slider once to sync, the state is then persisted).
+  See *How it works*.
+- **Optional volume overlay** — a card in the corner showing device name and level when
+  the system volume changes. Off by default (Windows already has one).
 - **Global hotkeys** — configurable/rebindable (cycle output, mute, cycle EQ preset),
   with a master on/off switch.
 - **Bluetooth battery** — headset battery % read from the HFP device node
@@ -56,9 +59,32 @@ The result is a single ~1.4 MB `eposwitch.exe` with no external dependencies.
   (`IMMDeviceEnumerator`, `IAudioEndpointVolume`, `IAudioSessionManager2`,
   undocumented `IPolicyConfig` for default-device switching).
 - **ANC state** is read passively from the dongle's vendor HID interface
-  (`vid_1395&pid_0303&mi_03&col01`): the 107-byte input report (report ID 1) is pushed
-  on every ANC key press; byte 17 is the on/off flag. The monitor opens the device in
-  shared mode and only *reads* — it never writes to the headset.
+  (`vid_1395&pid_0303&mi_03&col01`). The 107-byte input report (report ID 1) is not a
+  byte array but a **uint16 little-endian field array** starting at byte 1:
+
+  | field | idle heartbeat | on slider toggle | meaning |
+  |---|---|---|---|
+  | `w2` (byte 5) | `4` | `271` | report kind: heartbeat vs. real event |
+  | `w5` (byte 11) | `95` | `140` = off, `153` = on | correlated level |
+  | `w8` (byte 17) | `40` (`0x28`) | `0` = off, `1` = on | **ANC state** |
+
+  Two things bit us here and are worth knowing if you write your own parser: the idle
+  heartbeat reuses `0x28` in the ANC field (truthy, but not a state), and it arrives
+  every ~2 s — so a naive `buf[17] ? 1 : 0` both misreads it *and* overwrites the real
+  state two seconds after you toggle the slider. Only `w8 ∈ {0,1}` is a real event;
+  everything else is a heartbeat to be discarded.
+
+  The device cannot be *queried*: `HidD_GetFeature` / `GetInputReport` both fail with
+  `ERROR_GEN_FAILURE`, and the report descriptor exposes no feature reports. So the
+  state is event-driven and cached in `settings.ini` — the panel can only show the last
+  known value, refreshed when you move the slider.
+
+- **Volume overlay** listens to `IAudioEndpointVolume::RegisterControlChangeNotify`
+  instead of reading HID. The volume wheel sends standard consumer-control reports, but
+  `hidconsumer` drains that input queue first (HID reads are first-come-first-served),
+  so a second handle sees nothing. Watching the endpoint covers every source — wheel,
+  media keys, mixer, our own slider — regardless of device.
+
 
 ## Known limitations
 

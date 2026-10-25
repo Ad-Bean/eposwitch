@@ -31,6 +31,7 @@ enum Page {
 enum {
     ACT_NONE = 0,
     ACT_LANG,        // 语言切换
+    ACT_GOTO_DEV,    // 侧栏左下角"当前输出"行 → 跳转设备页
     ACT_OUTPUT,      // 输出设备卡片
     ACT_CAPTURE,     // 从官方捕获
     ACT_SAVE,        // 保存为预设
@@ -92,7 +93,8 @@ struct AppState {
     float ovDevScroll = 0;
 
     // ANC 开关状态（HID 只读监听；-1 = 未同步，等用户按一次耳机 ANC 键）
-    int ancState = -1;
+    int  ancState = -1;
+    DWORD ancAt = 0;          // 最后一次收到 dongle ANC 报告的时刻（GetTickCount）
     int ancLevel = -1;        // 报告里与 ANC 联动的另一字段（0x99/0x8c，含义未定）
 
     // 应用规则页（profiles.txt 的界面化编辑）
@@ -110,6 +112,7 @@ struct AppState {
     bool setAutostart    = false; // 开机自动启动
     bool setCloseToTray  = true;  // 关闭按钮收进托盘（否则直接退出）
     bool setHotkeys      = true;  // 启用全局快捷键
+    bool setVolOsd       = false; // 音量 OSD 浮层（Windows 自带，默认关）
 
     // 全局快捷键的显示副本（main.cpp 每次定时器刷新）
     struct HkView { std::wstring text; bool ok = true; };
@@ -155,6 +158,7 @@ struct AppState {
     bool langOpen = false;        // 侧栏语言下拉是否展开
     bool pipeReady = false;
     bool serviceOk = false;
+    bool eposOnline = false;      // EPOS 设备在线（决定 EPOS 专属页是否出现在导航）
 
     const wchar_t* T(const wchar_t* zh, const wchar_t* en) const { return english ? en : zh; }
 };
@@ -210,6 +214,7 @@ enum {
     CID_MIC_TEST = 840,        // 麦克风输入测试开关按钮
     CID_DEVVOL = 850,          // 850.. 设备页单端点音量条（index = 可见行序号）
     CID_MIXVOL = 860,          // 860.. 混音器单应用音量条（index = 行序号）
+    CID_PRESET_DEL = 880,      // 自定义预设卡片右上角 ×（index = 预设序号）
     CID_APP_PICK = 870         // 870.. 应用规则预设下拉项
 };
 
@@ -230,21 +235,49 @@ inline int VisibleEndpointIndex(const AppState& st, int visibleIdx) {
 enum SegKind { SEG_SURROUND = 0, SEG_VOICE, SEG_DIRECT, SEG_NR, SEG_NOISEGATE, SEG_COUNT };
 
 // ---------------- 导航定义 ----------------
-struct NavDef { const wchar_t* zh; const wchar_t* en; int page; };
+// ★ 通用音频面板：总览/设备/混音器/应用/设置永远显示；
+//   eposOnly 的页面（EPOS 设备专属控制）只在 EPOS 设备在线时出现在导航里。
+struct NavDef { const wchar_t* zh; const wchar_t* en; int page; int icon; bool eposOnly; };
 inline const NavDef* Navs() {
     static const NavDef n[] = {
-        { L"总览",     L"Overview",  PAGE_OVERVIEW },
-        { L"声音",     L"Sound",     PAGE_SOUND },
-        { L"麦克风",   L"Microphone",PAGE_MIC },
-        { L"设备",     L"Devices",   PAGE_DEVICES },
-        { L"混音器",   L"Mixer",     PAGE_MIXER },
-        { L"应用",     L"App rules", PAGE_APPS },
-        { L"固件",     L"Firmware",  PAGE_FIRMWARE },
-        { L"设置",     L"Settings",  PAGE_SETTINGS },
+        { L"总览",     L"Overview",   PAGE_OVERVIEW,  1, false },  // ICON_HEADSET
+        { L"声音",     L"Sound",      PAGE_SOUND,     9, true  },  // ICON_EQ
+        { L"麦克风",   L"Microphone", PAGE_MIC,       3, true  },  // ICON_MIC
+        { L"设备",     L"Devices",    PAGE_DEVICES,   2, false },  // ICON_SPEAKER
+        { L"混音器",   L"Mixer",      PAGE_MIXER,     7, false },  // ICON_VOLUME
+        { L"应用",     L"App rules",  PAGE_APPS,     10, false },  // ICON_PRESET
+        { L"固件",     L"Firmware",   PAGE_FIRMWARE,  5, true  },  // ICON_CHIP
+        { L"设置",     L"Settings",   PAGE_SETTINGS, 15, false },  // ICON_SLIDERS
     };
     return n;
 }
 inline int NavCount() { return 8; }
+inline bool PageNeedsEpos(int page) {
+    return page == PAGE_SOUND || page == PAGE_MIC || page == PAGE_FIRMWARE;
+}
+
+// ---- 动态导航助手（绘制 / 命中 / 点击分发共用）----
+// 可见导航里第 visibleIdx 项（跳过 eposOnly 页面）
+inline const NavDef& NavAt(const AppState& st, int visibleIdx) {
+    int k = -1;
+    for (int i = 0; i < NavCount(); i++) {
+        if (!st.eposOnline && Navs()[i].eposOnly) continue;
+        if (++k == visibleIdx) return Navs()[i];
+    }
+    return Navs()[0];
+}
+inline int NavVisibleCount(const AppState& st) {
+    int n = 0;
+    for (int i = 0; i < NavCount(); i++)
+        if (st.eposOnline || !Navs()[i].eposOnly) n++;
+    return n;
+}
+// 按页面枚举取 NavDef（页面可能不在当前可见导航里，标题栏用）
+inline const NavDef* NavByPage(const AppState& st, int page) {
+    for (int i = 0; i < NavCount(); i++)
+        if (Navs()[i].page == page) return &Navs()[i];
+    return &Navs()[0];
+}
 
 // =====================================================================
 // ★ 统一布局计算 —— 绘制与命中测试的唯一真相来源
@@ -279,7 +312,8 @@ struct Layout {
     int navItemH = 42, navItemBoxH = 38;                      // 导航项间距 / 有效高
     // 侧栏底部设置卡片（语言）
     int footX = 0, footY = 0, footW = 0, footH = 0;
-    int langX = 0, langY = 0, langW = 0, langH = 0;           // 语言下拉（收起态）
+    int langX = 0, langY = 0, langW = 0, langH = 0;           // 语言按钮（收起态）
+    int outY = 0;                                             // 通用模式：当前输出行（footer 上方）
     int langPopY = 0, langPopH = 0, langItemH = 0;            // 语言下拉（展开态）
 
     // 概览页：音量卡片
@@ -320,7 +354,7 @@ struct Layout {
     int appPickY = 0, appPickH = 0, appPickItemH = 0;
 
     // 设置页
-    int setY = 0, setRowH = 54, setN = 7;
+    int setY = 0, setRowH = 54, setN = 8;
     int setLangTitleY = 0, setLangY = 0, setLangRowH = 38;
     int setHkTitleY = 0, setHkY = 0, setHkRowH = 38;
     int setInfoTitleY = 0, setInfoY = 0;
@@ -353,6 +387,18 @@ inline const MicPreset* MicPresets() {
     return p;
 }
 inline int MicPresetCount() { return 5; }
+
+// 由当前 9 段曲线反推是哪个麦克风预设（容差 0.15dB；都不匹配返回 -1）
+inline int MatchMicPreset(const double eq[9]) {
+    const MicPreset* ps = MicPresets();
+    for (int i = 0; i < MicPresetCount(); i++) {
+        bool same = true;
+        for (int b = 0; b < 9; b++)
+            if (fabs(eq[b] - ps[i].eq[b]) > 0.15) { same = false; break; }
+        if (same) return i;
+    }
+    return -1;
+}
 
 // 预设卡片网格列数
 inline int PresetCols() { return 3; }
@@ -407,18 +453,21 @@ inline Layout ComputeLayout(const AppState& st) {
     L.navItemBoxH = SC(38);
 
     // 侧栏底部设置卡片：贴底，留 12 边距；高度按内容算
-    L.footH = SC(82);
+    L.footH = SC(40);
     L.footX = SC(10);
     L.footW = SC(m.navW) - SC(20);
-    L.footY = m.h - L.footH - SC(12);
-    L.langX = L.footX + SC(12);
-    L.langY = L.footY + SC(30);
-    L.langW = L.footW - SC(24);
+    L.footY = m.h - L.footH - SC(10);
+    // 语言按钮：行右端的紧凑图标方块（左边是服务状态文字）
+    L.langW = SC(34);
     L.langH = SC(28);
-    // 语言下拉列表：向上展开（卡片本身就贴底，向下会超出窗口）
+    L.langX = L.footX + L.footW - L.langW;
+    L.langY = L.footY + (L.footH - L.langH) / 2;
+    // 语言下拉列表：向上展开（贴底，向下会超出窗口）；宽度沿用整条底部
     L.langItemH = SC(30);
     L.langPopH = L.langItemH * 2 + SC(8);
     L.langPopY = L.langY - L.langPopH - SC(6);
+    // 通用模式：当前默认输出显示在侧栏左下角（服务状态行上方）
+    L.outY = L.footY - SC(20);
 
     // ---- 声音页 ----
     int nP = PresetCount(st);
@@ -487,7 +536,7 @@ inline Layout ComputeLayout(const AppState& st) {
     // 绘制与命中都必须走这几个 y，别在页面里自己加偏移。
     L.setY = L.viewY + pad - L.scroll + L.titleH;
     L.setRowH = SC(54);
-    L.setN = 7;
+    L.setN = 8;
     L.setLangTitleY = L.setY + L.setN * L.setRowH + SC(m.blockGap);
     L.setLangRowH = SC(38);
     L.setLangY = L.setLangTitleY + L.titleH;
@@ -660,7 +709,7 @@ inline HitInfo HitTest(const AppState& st, POINT p) {
     if (p.x < navW) {
         // 语言下拉展开时优先级最高（它盖在导航项上面）
         if (st.langOpen) {
-            RectF pr((REAL)L.langX, (REAL)L.langPopY, (REAL)L.langW, (REAL)L.langPopH);
+            RectF pr((REAL)L.footX, (REAL)L.langPopY, (REAL)L.footW, (REAL)L.langPopH);
             if (InRect(pr, p)) {
                 int idx = (int)((p.y - pr.Y - SC(4)) / (REAL)L.langItemH);
                 if (idx < 0) idx = 0;
@@ -673,7 +722,8 @@ inline HitInfo HitTest(const AppState& st, POINT p) {
         // ★ id 必须带序号：DrawSidebar 用 hoverId == CID_PAGE_BASE + i 判断悬停，
         //   之前只返回 CID_PAGE_BASE，导致只有第 0 项（总览）有 hover 效果。
         int y = L.navTop;
-        for (int i = 0; i < NavCount(); i++) {
+        int navN = NavVisibleCount(st);
+        for (int i = 0; i < navN; i++) {
             RectF r((REAL)SC(10), (REAL)y, (REAL)(navW - SC(20)), (REAL)L.navItemBoxH);
             if (InRect(r, p)) { h.id = CID_PAGE_BASE + i; h.index = i; return h; }
             y += L.navItemH;
@@ -683,6 +733,14 @@ inline HitInfo HitTest(const AppState& st, POINT p) {
             RectF lr((REAL)L.langX, (REAL)L.langY, (REAL)L.langW, (REAL)L.langH);
             if (InRect(lr, p)) {
                 h.id = CID_ACTION; h.action = ACT_LANG; h.index = 0;
+                return h;
+            }
+        }
+        // 左下角信息行（EPOS 耳机 / 当前输出）可点击 → 设备页
+        {
+            RectF orr((REAL)L.footX, (REAL)(L.outY - SC(2)), (REAL)L.footW, (REAL)SC(18));
+            if (InRect(orr, p)) {
+                h.id = CID_ACTION; h.action = ACT_GOTO_DEV; h.index = 0;
                 return h;
             }
         }
@@ -697,9 +755,7 @@ inline HitInfo HitTest(const AppState& st, POINT p) {
         if (InRect(hitCb, p)) { h.id = CID_CLOSE; return h; }
     }
 
-    // 顶栏：设备选择器
-    RectF devSel((REAL)L.devSelX, (REAL)L.devSelY, (REAL)L.devSelW, (REAL)L.devSelH);
-    if (InRect(devSel, p)) { h.id = CID_DEV_SELECT; return h; }
+    // 顶栏已无设备选择器（设备信息在侧栏左下角）
 
     const int dd2 = m.dpi;
     auto SC2 = [dd2](int v) { return MulDiv(v, dd2, 96); };
@@ -769,6 +825,12 @@ inline HitInfo HitTest(const AppState& st, POINT p) {
             RectF cr((REAL)(L.contentX + c * (L.presetCardW + SC2(m.gutter))),
                      (REAL)(L.presetGridY + r * (L.presetCardH + SC2(m.gutter))),
                      (REAL)L.presetCardW, (REAL)L.presetCardH);
+            // 自定义预设右上角的 ×（先判，否则会被整卡命中吃掉）
+            if (!st.presets[i].builtin) {
+                RectF xx(cr.X + cr.Width - (REAL)SC2(22), cr.Y + (REAL)SC2(4),
+                         (REAL)SC2(18), (REAL)SC2(18));
+                if (InRect(xx, p)) { h.id = CID_PRESET_DEL; h.index = i; return h; }
+            }
             if (InRect(cr, p)) { h.id = CID_PRESET_BASE; h.index = i; return h; }
         }
         // ---- 扬声器 EQ 曲线 ----

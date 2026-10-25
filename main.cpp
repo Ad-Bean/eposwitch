@@ -931,6 +931,9 @@ static int  g_mixVolDrag = -1;      // 混音器：正在拖动第几行的音�
 static DWORD g_presetReloadAt = 0;  // 上次重新读取预设列表的时刻（0 = 需要立即重读）
 static int  g_sldDrag = -1;         // 正在拖动的滑块 (0=混响 1=噪声门 2=侧音)
 static DWORD g_lastDevPoll = 0;
+static DWORD g_lastDevListReq = 0;   // 上次主动请求设备列表（rt=1）的时间
+static bool  g_soundRestorePending = false;  // 启动时把本地音效状态推回设备（只推一次）
+static DWORD g_soundDirtyAt = 0;             // 音效改动时间（用于防抖落盘）
 
 static int g_battery = -1;
 static double g_batteryAge = 1e9;
@@ -1053,6 +1056,10 @@ struct Strategy {
 #include <gdiplus.h>
 using namespace Gdiplus;
 
+// 音量 OSD：挂 CoreAudio 通知，系统音量一变就在右下角弹提示。
+// 这是在"读不到音量轮 HID 报告"之后换的路线 —— 见技术笔记第二十轮。
+#include "volosd.h"
+
 // ---- 全局状态（原全局区，重排版后必须保留） ----
 static HINSTANCE g_inst = nullptr;
 static AudioCore g_audio;
@@ -1070,6 +1077,11 @@ static ProbeResult g_probe = PROBE_UNKNOWN;
 static DWORD g_lastSwitchTick = 0;
 
 
+// 管道里第一次出现某个 messageType 时记一条（智能按钮等事件可能走这里）
+namespace epospipe {
+void PipeNewTypeLog(int mt) { Log(L"pipe: new messageType=%d", mt); }
+}
+
 static void Log(const wchar_t* fmt, ...) {
   wchar_t buf[1024];
   va_list ap; va_start(ap, fmt);
@@ -1079,8 +1091,13 @@ static void Log(const wchar_t* fmt, ...) {
   GetModuleFileNameW(nullptr, path, MAX_PATH);
   wchar_t* slash = wcsrchr(path, L'\\');
   if (slash) wcscpy(slash + 1, L"eposwitch.log");
+  // ★ 加时间戳：排查"什么时候翻转的/什么时候刷新的"全靠它
+  SYSTEMTIME st; GetLocalTime(&st);
   FILE* f = _wfopen(path, L"a, ccs=UTF-8");
-  if (f) { fwprintf(f, L"%ls\n", buf); fclose(f); }
+  if (f) {
+    fwprintf(f, L"%02d:%02d:%02d.%03d %ls\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    fclose(f);
+  }
 }
 
 
@@ -1230,6 +1247,22 @@ struct AppSettings {
   std::string hkOut  = "CTRL+ALT+P";
   std::string hkMute = "CTRL+ALT+M";
   std::string hkEq   = "CTRL+ALT+Q";
+  // ---- 音效状态（设备不回报 EQ，只能本地持久化；soundSaved=false 时不推送）----
+  bool   soundSaved  = false;
+  double spkEq[9]    = {0};
+  double micEq[9]    = {0};
+  double reverb      = 0;
+  double noiseGate   = 0;
+  double sideTone    = 0;
+  bool   directSound = false;
+  bool   voiceEnhance= false;
+  int    surround3D  = 0;
+  // ANC 是耳机上的物理滑块，dongle 只在"拨动瞬间"上报新状态（之后是心跳包），
+  // 启动时无法主动查询 —— 所以最后一次已知状态必须自己存。
+  // -1 = 未知（还没拨过 / 从没同步过）
+  int    ancState    = -1;
+  // 音量浮层：Windows 自带 OSD 已够用，默认关
+  bool   volOsd      = false;
 };
 
 static const wchar_t* kRunKey =
@@ -1268,6 +1301,18 @@ static bool SetAutostart(bool on) {
   return ok;
 }
 
+// "0.0,1.5,-2,..." -> 9 段 EQ
+static void ParseEqList(const std::string& s, double out[9]) {
+  size_t i = 0, k = 0;
+  while (i <= s.size() && k < 9) {
+    size_t e = s.find(',', i);
+    if (e == std::string::npos) e = s.size();
+    out[k++] = atof(s.substr(i, e - i).c_str());
+    i = e + 1;
+  }
+  for (; k < 9; k++) out[k] = 0;
+}
+
 static AppSettings LoadSettings() {
   AppSettings a;
   FILE* f = _wfopen(SettingsPath().c_str(), L"r");
@@ -1292,6 +1337,17 @@ static AppSettings LoadSettings() {
       else if (key == "hotkey_out")    a.hkOut       = val;
       else if (key == "hotkey_mute")   a.hkMute      = val;
       else if (key == "hotkey_eq")     a.hkEq        = val;
+      else if (key == "sound_saved")   a.soundSaved  = on;
+      else if (key == "speaker_eq")    ParseEqList(val, a.spkEq);
+      else if (key == "mic_eq")        ParseEqList(val, a.micEq);
+      else if (key == "reverb")        a.reverb      = atof(val.c_str());
+      else if (key == "noise_gate")    a.noiseGate   = atof(val.c_str());
+      else if (key == "side_tone")     a.sideTone    = atof(val.c_str());
+      else if (key == "direct_sound")  a.directSound = on;
+      else if (key == "voice_enhance") a.voiceEnhance= on;
+      else if (key == "surround3d")    a.surround3D  = atoi(val.c_str());
+      else if (key == "anc_state")     a.ancState    = atoi(val.c_str());
+      else if (key == "vol_osd")       a.volOsd      = on;
     }
     fclose(f);
   }
@@ -1317,6 +1373,17 @@ static void SaveSettings(const AppSettings& a) {
   fprintf(f, "hotkey_out=%s\n",    a.hkOut.c_str());
   fprintf(f, "hotkey_mute=%s\n",   a.hkMute.c_str());
   fprintf(f, "hotkey_eq=%s\n",     a.hkEq.c_str());
+  // 音效状态（设备不回读，必须自己记）
+  fprintf(f, "sound_saved=%d\n",   a.soundSaved ? 1 : 0);
+  fprintf(f, "speaker_eq=");
+  for (int i = 0; i < 9; i++) fprintf(f, "%s%.2f", i ? "," : "", a.spkEq[i]);
+  fprintf(f, "\nmic_eq=");
+  for (int i = 0; i < 9; i++) fprintf(f, "%s%.2f", i ? "," : "", a.micEq[i]);
+  fprintf(f, "\nreverb=%.3f\nnoise_gate=%.3f\nside_tone=%.1f\n", a.reverb, a.noiseGate, a.sideTone);
+  fprintf(f, "direct_sound=%d\nvoice_enhance=%d\nsurround3d=%d\n",
+          a.directSound ? 1 : 0, a.voiceEnhance ? 1 : 0, a.surround3D);
+  fprintf(f, "anc_state=%d\n", a.ancState);
+  fprintf(f, "vol_osd=%d\n",   a.volOsd ? 1 : 0);
   fclose(f);
 }
 
@@ -1334,6 +1401,17 @@ static AppSettings CurrentSettings() {
   a.hkOut  = NarrowAscii(HkFormat(g_hkSlots[0].mods, g_hkSlots[0].vk));
   a.hkMute = NarrowAscii(HkFormat(g_hkSlots[1].mods, g_hkSlots[1].vk));
   a.hkEq   = NarrowAscii(HkFormat(g_hkSlots[2].mods, g_hkSlots[2].vk));
+  // 音效状态
+  a.soundSaved = true;
+  for (int i = 0; i < 9; i++) { a.spkEq[i] = g_app.sound.speakerEq[i]; a.micEq[i] = g_app.sound.micEq[i]; }
+  a.reverb       = g_app.sound.reverb;
+  a.noiseGate    = g_app.sound.noiseGate;
+  a.sideTone     = g_app.sound.sideToneLevel;
+  a.directSound  = g_app.sound.directSound;
+  a.voiceEnhance = g_app.sound.voiceEnhance;
+  a.surround3D   = g_app.sound.surround3D;
+  a.ancState     = g_app.ancState;
+  a.volOsd       = g_app.setVolOsd;
   return a;
 }
 
@@ -1353,6 +1431,13 @@ static void ApplySettings(const AppSettings& a) {
   g_appPresetOn = a.appPreset;
   g_app.setHotkeys = a.hotkeys;
   g_hkEnabled = a.hotkeys;
+  g_app.setVolOsd = a.volOsd;
+  // ANC：dongle 无法主动查询，只能靠拨动时的事件上报；先把上次已知状态摆上去，
+  // ancAt=1 作为"来自磁盘、不是本次运行同步的"哨兵（UI 据此改措辞）。
+  if (a.ancState == 0 || a.ancState == 1) {
+    g_app.ancState = a.ancState;
+    g_app.ancAt = 1;
+  }
   // 组合键：解析失败/为空一律按"未设置"处理（UI 显示"未设置"，不注册）
   UINT m = 0, v = 0;
   const std::string* src[3] = { &a.hkOut, &a.hkMute, &a.hkEq };
@@ -1360,6 +1445,34 @@ static void ApplySettings(const AppSettings& a) {
     if (HkParse(*src[i], m, v)) { g_hkSlots[i].mods = m; g_hkSlots[i].vk = v; }
     else { g_hkSlots[i].mods = 0; g_hkSlots[i].vk = 0; }
     g_hkSlots[i].ok = false;
+  }
+  // 音效状态：本地保存的优先（设备不回读 EQ，见 eposdev.h 的说明）
+  if (a.soundSaved) {
+    for (int i = 0; i < 9; i++) {
+      g_app.sound.speakerEq[i] = a.spkEq[i];
+      g_app.sound.micEq[i]     = a.micEq[i];
+    }
+    g_app.sound.reverb       = a.reverb;
+    g_app.sound.noiseGate    = a.noiseGate;
+    g_app.sound.sideToneLevel= a.sideTone;
+    g_app.sound.directSound  = a.directSound;
+    g_app.sound.voiceEnhance = a.voiceEnhance;
+    g_app.sound.surround3D   = a.surround3D;
+    g_app.sound.clamp();
+    g_panel.sound = g_app.sound;
+    // ★ chip 高亮要按曲线反推，否则恢复后曲线对了、高亮还停在"默认"（用户实测报的 bug）
+    g_app.micPresetIdx = eui2::MatchMicPreset(g_app.sound.micEq);
+    {
+      int match = -1;
+      for (size_t i = 0; i < g_app.presets.size(); i++) {
+        bool same = true;
+        for (int b = 0; b < 9; b++)
+          if (fabs(g_app.presets[i].speakerEq[b] - g_app.sound.speakerEq[b]) > 0.15) { same = false; break; }
+        if (same) { match = (int)i; break; }
+      }
+      g_app.currentPreset = match;
+    }
+    g_soundRestorePending = true;    // 设备就绪后推回一次
   }
 }
 
@@ -1908,17 +2021,17 @@ static void UpdateTray() {
   nid.uCallbackMessage = WM_TRAYICON;
   nid.hIcon = ic;
 
-  std::wstring tip = L"EPOS H3PRO\n";
+  std::wstring tip = L"音频控制台\n";
   std::wstring curName = L"(无)";
   std::wstring curId = g_audio.DefaultId(eConsole);
   for (auto& e : g_eps) if (e.id == curId) curName = e.name;
 
-  wchar_t b[64];
-  if (g_battery >= 0) swprintf(b, 64, L"电量 %d%%", g_battery);
-  else                                        wcscpy(b, L"电量未知");
-  tip += b;
-  tip += (g_probe == PROBE_ONLINE) ? L" · 已连接" : L" · 未连接";
-  tip += L"\n输出: " + curName;
+  if (g_battery >= 0) {
+    wchar_t b[64];
+    swprintf(b, 64, L"EPOS 电量 %d%%\n", g_battery);
+    tip += b;
+  }
+  tip += L"输出: " + curName;
   wcsncpy(nid.szTip, tip.c_str(), 127);
 
   std::wstring curId2 = g_audio.DefaultId(eConsole);
@@ -2197,6 +2310,8 @@ static void UpdateMicMeter() {
 // 限制：报告只在按键时发送，所以程序启动后需要用户按一次 ANC 才能同步状态。
 static std::atomic<bool> g_ancRun{false};
 static std::thread       g_ancThread;
+// ANC 线程只置脏标志，真正落盘交给主线程（避免两个线程同时 fopen("w") 写坏配置）
+static std::atomic<bool> g_ancDirty{false};
 
 static std::wstring FindAncHidPath() {
   auto lowcopy = [](std::wstring s) {
@@ -2246,7 +2361,9 @@ static void AncMonitorLoop() {
         HidD_FreePreparsedData(pp);
       }
     }
-    if (caps.InputReportByteLength != 107) {   // 不是 vendor 状态接口就重试
+    // 不再强制要求 107 字节：智能旋钮可能走别的 report id / 长度，
+    // 先都读进来，解析时再按 id 区分。
+    if (caps.InputReportByteLength < 2) {
       CloseHandle(h);
       Sleep(3000);
       continue;
@@ -2266,14 +2383,57 @@ static void AncMonitorLoop() {
         }
         if (!GetOverlappedResult(h, &ov, &got, FALSE)) break;
       }
-      if (got >= 18 && buf[0] == 1) {
-        int newState = buf[17] ? 1 : 0;
-        int newLevel = buf[11];
-        if (newState != g_app.ancState || newLevel != g_app.ancLevel) {
-          g_app.ancState = newState;
-          g_app.ancLevel = newLevel;
-          Log(L"anc: state=%d level=0x%02x", newState, newLevel);
-          if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+      if (got >= 2) {
+        // 与上一份报告逐字节比对（所有 report id 都记），最多打印 12 处差异
+        static BYTE lastRep[256] = {};
+        static DWORD lastLen = 0;
+        bool changed = (got != lastLen) || memcmp(lastRep, buf.data(), got) != 0;
+        if (changed) {
+          std::wstring d;
+          wchar_t b[40];
+          if (lastLen == 0) {
+            Log(L"hid: first report id=%u len=%u", buf[0], got);
+          } else {
+            int shown = 0;
+            DWORD n = got < lastLen ? got : lastLen;
+            for (DWORD i = 0; i < n && shown < 12; i++) {
+              if (lastRep[i] != buf[i]) {
+                swprintf(b, 40, L" [%u]%02x>%02x", i, lastRep[i], buf[i]);
+                d += b; shown++;
+              }
+            }
+            if (got != lastLen) { swprintf(b, 40, L" len %u>%u", lastLen, got); d += b; }
+            Log(L"hid: id=%u diff%ls", buf[0], d.c_str());
+          }
+          DWORD cp = got < sizeof(lastRep) ? got : (DWORD)sizeof(lastRep);
+          memcpy(lastRep, buf.data(), cp);
+          lastLen = got;
+        }
+
+        // ---- vendor 报告解析（107 字节，report id=1，从 byte1 起是 uint16 小端字段数组）----
+        //   w2 = byte5/6  : 4  = 空闲心跳（约 2 秒一份）；271(0x010f) = 一次用户操作
+        //   w5 = byte11/12: 95 空闲 / 140 ANC关 / 153 ANC开（与 w8 联动，含义仍未定）
+        //   w8 = byte17/18: ANC 状态，只有 0/1 有意义；心跳里是 40(0x28) 这个占位值
+        //
+        // ★ 这里踩过的坑：旧代码用 buf[17] ? 1 : 0 判状态，把心跳的 0x28 当成"开"，
+        //   并且每 2 秒一次的心跳会把刚拨出来的真实状态冲掉 —— 所以 UI 永远在跳，
+        //   用户永远不知道 ANC 到底是开是关。现在只认 0/1，其余一律当心跳忽略。
+        if (buf[0] == 1 && got >= 19) {
+          int w2 = buf[5]  | (buf[6]  << 8);
+          int w5 = buf[11] | (buf[12] << 8);
+          int w8 = buf[17] | (buf[18] << 8);
+          if (w8 == 0 || w8 == 1) {
+            g_app.ancAt = GetTickCount();     // 只有真实事件才算"同步过"
+            if (w8 != g_app.ancState || w5 != g_app.ancLevel) {
+              g_app.ancState = w8;
+              g_app.ancLevel = w5;
+              Log(L"anc: state=%d level=%d (event w2=%d)", w8, w5, w2);
+              g_ancDirty = true;                 // 由主线程落盘
+              if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+            }
+          } else if (w8 != 40) {
+            Log(L"anc: unknown w8=%d w2=%d w5=%d (ignored)", w8, w2, w5);
+          }
         }
       }
     }
@@ -2737,6 +2897,7 @@ static void ApplySoundToDevice2() {
   g_pipe.Request(epospipe::Client::BuildSurround3D(g_app.sound.surround3D));
   g_pipe.Request(epospipe::Client::BuildSideTone((int)(g_app.sound.sideToneLevel + 0.5)));
   g_panel.dirty = false;
+  g_soundDirtyAt = GetTickCount();   // 交给定时器防抖落盘
 }
 
 static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
@@ -2772,7 +2933,8 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
   case eui2::CID_PAGE_BASE + 5:
   case eui2::CID_PAGE_BASE + 6:
   case eui2::CID_PAGE_BASE + 7:
-    g_app.page = eui2::Navs()[h.index].page;
+    // ★ 导航是动态的（EPOS 离线时隐藏专属页），必须经 NavAt 映射
+    g_app.page = eui2::NavAt(g_app, h.index).page;
     g_app.scroll.offset = 0;
     g_app.contentOffset = 0;
     // 进设备页立即刷新每行音量（否则头 2 秒没有音量条）
@@ -2845,6 +3007,20 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
       SyncSoundFromDevice();
     }
     break;
+
+  // 删除自定义预设（卡片右上角 ×）——只在自定义项上生效，出厂预设不可删
+  case eui2::CID_PRESET_DEL: {
+    if (h.index < 0 || h.index >= (int)g_app.presets.size()) break;
+    if (g_app.presets[h.index].builtin) break;
+    std::wstring nm = g_app.presets[h.index].zh;
+    g_app.presets.erase(g_app.presets.begin() + h.index);
+    if (g_app.currentPreset == h.index)      g_app.currentPreset = -1;
+    else if (g_app.currentPreset > h.index)  g_app.currentPreset--;
+    eposfx::SaveCustomPresets(g_app.presets);
+    Log(L"preset: deleted custom '%ls'", nm.c_str());
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+    break;
+  }
 
   case eui2::CID_PRESET_BASE: {
     if (h.index < 0 || h.index >= (int)g_app.presets.size()) break;
@@ -3074,6 +3250,15 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
       break;
     }
 
+    case eui2::ACT_GOTO_DEV:   // 左下角"当前输出"行 → 设备页
+      if (g_app.page != eui2::PAGE_DEVICES) {
+        g_app.page = eui2::PAGE_DEVICES;
+        g_app.devTab = 0;               // 输出设备在播放页
+        g_app.contentOffset = 0;
+        RefreshDevVolumes();            // 立即出音量条，不等 2s 定时器
+      }
+      break;
+
     case eui2::ACT_DEV_TAB:
       if (g_app.devTab != h.index) {
         g_app.devTab = h.index;
@@ -3089,10 +3274,10 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
       break;
 
     case eui2::ACT_SET_TOGGLE: {
-      bool* fields[7] = { &g_app.setAutostart, &g_app.setCloseToTray, &g_app.setAutoSwitch,
+      bool* fields[8] = { &g_app.setAutostart, &g_app.setCloseToTray, &g_app.setAutoSwitch,
                           &g_app.setAutoRestore, &g_app.setBattAlert, &g_app.setAppPreset,
-                          &g_app.setHotkeys };
-      if (h.index >= 0 && h.index < 7) {
+                          &g_app.setHotkeys, &g_app.setVolOsd };
+      if (h.index >= 0 && h.index < 8) {
         bool nv = !*fields[h.index];
         *fields[h.index] = nv;
         switch (h.index) {
@@ -3114,6 +3299,13 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
             HkSay(g_app.english
                     ? (nv ? L"Hotkeys enabled" : L"All hotkeys released")
                     : (nv ? L"已启用全局快捷键" : L"已停用全部全局快捷键"));
+            break;
+          }
+          case 7: { // 音量浮层：关掉就连回调一起摘掉，彻底不做无用功
+            bool ok = false;
+            if (nv) ok = volosd::Attach(g_hwnd);
+            else    volosd::Detach();
+            Log(L"settings: volume osd -> %d (attach=%d)", (int)nv, (int)ok);
             break;
           }
           default: break;
@@ -3222,8 +3414,30 @@ static void PollDeviceList() {
   if (now - g_lastDevPoll < 1000) return;
   g_lastDevPoll = now;
 
+  // ★ 主动刷新设备列表：官方服务在耳机开/关机时**不会**主动推送 DeviceList，
+  //   之前只在启动时请求一次 rt=1，导致耳机连上后 UI 长时间停在旧状态
+  //   （实测：要等下一次电池轮询的响应里夹带 DeviceList 才更新，延迟几十秒）。
+  //   rt=1 响应要 4~6 秒，所以 fire-and-forget（resp=nullptr），绝不在 UI 线程等。
+  if (now - g_lastDevListReq > 6000) {
+    g_lastDevListReq = now;
+    g_pipe.Request(epospipe::Client::BuildDeviceListQuery());
+  }
+
   auto devs = g_pipe.Devices();
-  if (devs.empty()) return;
+  if (devs.empty()) {
+    // EPOS 设备全部离线：清空缓存、退出 EPOS 专属页面（导航会随之收起）
+    if (!g_app.devices.empty()) {
+      g_app.devices.clear();
+      g_app.selectedDevice = -1;
+    }
+    g_app.eposOnline = false;
+    if (eui2::PageNeedsEpos(g_app.page)) {
+      g_app.page = eui2::PAGE_OVERVIEW;
+      g_app.contentOffset = 0;
+      InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+    return;
+  }
 
   bool changed = (devs.size() != g_app.devices.size());
   if (!changed) {
@@ -3235,6 +3449,20 @@ static void PollDeviceList() {
     }
   }
   g_app.devices = devs;
+  // ★ EPOS 专属页的显示条件是"耳机在线"，不是"dongle 在线"——
+  //   只有 dongle 时那些控制页也用不了，UI 应保持通用形态。
+  g_app.eposOnline = false;
+  for (auto& d : devs) if (d.IsHeadset()) { g_app.eposOnline = true; break; }
+  // 设备列表变化时留一条日志（排查"耳机连上 UI 没反应"这类问题全靠它）
+  if (changed)
+    Log(L"devices: list -> %d dev(s), headset=%d", (int)devs.size(), g_app.eposOnline ? 1 : 0);
+
+  // 启动时恢复：把本地保存的 EQ/效果推回设备（设备不回读，只能我们来推）
+  if (g_soundRestorePending && g_pipe.Ready()) {
+    g_soundRestorePending = false;
+    ApplySoundToDevice2();
+    Log(L"sound: local state pushed to device (restore)");
+  }
   // 优先选耳机条目（deviceType=3）；没有耳机则选第一个
   int wantIdx = -1;
   for (size_t i = 0; i < devs.size(); i++) {
@@ -3510,6 +3738,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
           if (frac < -1.0) frac = -1.0;
           if (isMic) {
             g_app.sound.micEq[g_eqDrag] = frac * 6.0;
+            // 拖到和某个预设一致时高亮跟着走，否则取消高亮
+            g_app.micPresetIdx = eui2::MatchMicPreset(g_app.sound.micEq);
           } else {
             g_app.sound.speakerEq[g_eqDrag] = frac * 6.0;
             g_app.currentPreset = -1;
@@ -3864,11 +4094,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
       return 0;
     }
 
+    case volosd::WM_VOLOSD_MSG: {
+      if (!g_app.setVolOsd) return 0;
+      // 系统音量变了（音量轮 / 媒体键 / 面板滑块 / 混音器都算）
+      std::wstring nm;
+      if (g_app.endpoints) {
+        for (const auto& ep : *g_app.endpoints)
+          if (ep.id == g_app.currentOutputId) { nm = ep.name; break; }
+      }
+      if (nm.empty()) nm = g_app.T(L"扬声器", L"Speakers");
+      volosd::Show((int)w, l != 0, nm);
+      return 0;
+    }
+
     case WM_APP_BOOT: {
       DWORD tB = GetTickCount();
       LoadAppRules();
       SyncAppRulesView();
       StartAncMonitor();     // ANC 开关 HID 只读监听（按键时上报）
+      if (g_app.setVolOsd) volosd::Attach(hwnd);   // 音量变化 → 右下角浮层（默认关）
       // 全局热键（可关闭 / 可改键；被别的软件占用会失败，只记日志不报错）
       RegisterAllHotkeys();
       Log(L"hotkeys: enabled=%d out=[%ls] mute=[%ls] eq=[%ls] -> ok=%d/%d/%d",
@@ -3894,6 +4138,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
       CheckBatteryAlert();     // 低电量提醒（20% / 10% 各一次）
       CheckAutoRestore();      // 耳机回来自动切回输出
       CheckAppPreset();        // 按前台应用切预设
+      if (g_ancDirty) {        // ANC 状态变了（HID 线程置位），在这里落盘
+        g_ancDirty = false;
+        SaveSettings(CurrentSettings());
+      }
+      // 默认输出换了 → 音量回调要重新挂到新端点上，否则 OSD 不跟着切
+      {
+        static std::wstring lastVolDev;
+        if (g_app.currentOutputId != lastVolDev) {
+          lastVolDev = g_app.currentOutputId;
+          if (g_app.setVolOsd) volosd::Attach(hwnd);
+        }
+      }
       DWORD tt2 = GetTickCount();
       if (g_newUi) {
         // ★ 只有"用户在麦克风页主动开了测试"才跑电平定时器。
@@ -3914,6 +4170,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         PollDeviceList();
         g_app.pipeReady = g_pipe.Ready();
+        // 音效状态防抖落盘：改动后 1.2 秒无新操作才写，避免拖 EQ 时刷盘几百次
+        if (g_soundDirtyAt && GetTickCount() - g_soundDirtyAt > 1200) {
+          g_soundDirtyAt = 0;
+          SaveSettings(CurrentSettings());
+        }
         // 设备页可见时刷新每行音量/静音（其它页面零开销）
         if (g_app.page == eui2::PAGE_DEVICES) RefreshDevVolumes();
         // 混音器页：刷新每应用音量

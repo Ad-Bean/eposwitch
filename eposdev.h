@@ -137,6 +137,13 @@ inline std::wstring JsonStr(const std::string& s, const char* key, const wchar_t
 inline double JsonNum(const std::string& s, const char* key, double def = 0) {
     size_t p;
     if (!JsonFind(s, key, p)) return def;
+    // ★ 服务把不少数值字段写成**字符串**（"latencyLevel":"-1"）。
+    //   直接 strtod 会读到引号、返回 0 —— 之前延迟模式因此被误显示为"标准"。
+    while (p < s.size() && s[p] == ' ') p++;
+    if (p < s.size() && s[p] == '"') {
+        p++;
+        if (p < s.size() && s[p] == '"') return def;   // 空串 -> 用默认值
+    }
     return strtod(s.c_str() + p, nullptr);
 }
 
