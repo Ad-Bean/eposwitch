@@ -3544,6 +3544,103 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
       if (!g_newUi) break;
       int delta = GET_WHEEL_DELTA_WPARAM(w);
 
+      // ★ 滚轮调音量：设备页 / 总览音量卡片 / 混音器三处统一处理。
+      //   命中策略一致 —— 横向严格限定在轨道（±6px），纵向放宽到整行：
+      //   轨道本身只有 7~8px 高，严格命中会让用户觉得"滚了没反应"。
+      //   步长也统一：一格（delta=120）= 5%，高精度滚轮按 delta 比例换算。
+      {
+        POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        ScreenToClient(hwnd, &p);
+        eui2::Layout L = eui2::ComputeLayout(g_app);
+        int step = (int)lround((double)delta * 5.0 / 120.0);
+        if (step == 0 && delta != 0) step = (delta > 0) ? 1 : -1;
+        auto clamp100 = [](int v) { return v < 0 ? 0 : (v > 100 ? 100 : v); };
+
+        // ---- 总览页：扬声器 / 麦克风两行滑块 ----
+        if (g_app.page == eui2::PAGE_OVERVIEW) {
+          for (int k = 0; k < 2; k++) {
+            int ry = L.volY + S(40) + k * L.volRowH;
+            if (p.x < L.volTrackX - S(6) || p.x > L.volTrackX + L.volTrackW + S(6)) continue;
+            if (p.y < ry - S(6) || p.y > ry + L.volRowH) continue;
+            if (k == 0) {
+              std::wstring sid = g_audio.DefaultId(eConsole);
+              int nv = clamp100(g_app.speakerVol + step);
+              if (!sid.empty() && nv != g_app.speakerVol) {
+                g_audio.SetVolumePct(sid, (float)nv / 100.0f, false);
+                g_app.speakerVol = nv;
+                Log(L"overview: wheel speaker -> %d%%", nv);
+                InvalidateRect(hwnd, nullptr, FALSE);
+              }
+            } else {
+              std::wstring mid = g_audio.DefaultCaptureId();
+              int nv = clamp100(g_app.micVol + step);
+              if (!mid.empty() && nv != g_app.micVol) {
+                g_audio.SetVolumePct(mid, (float)nv / 100.0f, true);
+                g_app.micVol = nv;
+                Log(L"overview: wheel mic -> %d%%", nv);
+                InvalidateRect(hwnd, nullptr, FALSE);
+              }
+            }
+            return 0;
+          }
+        }
+
+        // ---- 混音器：每行应用的音量条 ----
+        if (g_app.page == eui2::PAGE_MIXER) {
+          int mx = L.contentX + L.contentW - S(12) - S(26);
+          int tx = mx - S(8) - S(40) - S(8) - S(110);
+          for (int i = 0; i < (int)g_app.mix.size(); i++) {
+            int ry = L.mixY + i * L.mixRowH;
+            if (p.x < tx - S(6) || p.x > tx + S(110) + S(6)) continue;
+            if (p.y < ry || p.y > ry + L.mixRowH) continue;
+            auto& r = g_app.mix[i];
+            int nv = clamp100(r.vol + step);
+            DWORD pid = MixerPidByName(r.name);
+            if (pid && nv != r.vol) {
+              g_audio.SetAppVolumeByPid(pid, (float)nv / 100.0f);
+              r.vol = nv;
+              if (nv > 0) r.muted = false;   // 静音时调音量 = 想听声音
+              Log(L"mixer: wheel [%ls] -> %d%%", r.name.c_str(), nv);
+              InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+          }
+        }
+
+        // ---- 设备页：某一行端点的音量条 ----
+        if (g_app.page == eui2::PAGE_DEVICES) {
+          bool cap = (g_app.devTab == 1);
+          std::vector<Endpoint>* list = cap ? g_app.captureEndpoints : g_app.endpoints;
+          eui2::DevRows dr = eui2::DevLayout(g_app, L, cap);
+          if (list) {
+            for (size_t i = 0; i < dr.track.size() && i < dr.idx.size(); i++) {
+              const RectF& tr = dr.track[i];
+              if (tr.Width <= 0) continue;
+              if (p.x < tr.X - S(6) || p.x > tr.X + tr.Width + S(6)) continue;
+              const RectF& rw = (i < dr.row.size()) ? dr.row[i] : tr;
+              if (p.y < rw.Y || p.y > rw.Y + rw.Height) continue;
+
+              int row = (int)i;
+              const Endpoint& ep = (*list)[dr.idx[row]];
+              int cur = (row < (int)g_app.devVol.size()) ? g_app.devVol[row] : -1;
+              if (cur < 0) cur = g_audio.GetVolumePct(ep.id, cap);
+              int nv = clamp100(cur + step);
+              if (nv != cur) {
+                g_audio.SetVolumePct(ep.id, (float)nv / 100.0f, cap);
+                if (row < (int)g_app.devVol.size()) g_app.devVol[row] = nv;
+                if (row < (int)g_app.devMuted.size() && g_app.devMuted[row]) {
+                  g_audio.SetMuted(ep.id, false);
+                  g_app.devMuted[row] = false;
+                }
+                Log(L"devices: wheel [%ls] -> %d%%", ep.name.c_str(), nv);
+                InvalidateRect(hwnd, nullptr, FALSE);
+              }
+              return 0;
+            }
+          }
+        }
+      }
+
       // 总览页：光标在"已连接设备"面板上时，滚轮滚面板内部列表
       if (g_app.page == eui2::PAGE_OVERVIEW) {
         POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
