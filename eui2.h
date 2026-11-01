@@ -113,6 +113,7 @@ struct AppState {
     bool setCloseToTray  = true;  // 关闭按钮收进托盘（否则直接退出）
     bool setHotkeys      = true;  // 启用全局快捷键
     bool setVolOsd       = false; // 音量 OSD 浮层（Windows 自带，默认关）
+    bool setAlwaysOnTop  = false; // 窗口置顶（压住其他窗口，默认关）
 
     // 全局快捷键的显示副本（main.cpp 每次定时器刷新）
     struct HkView { std::wstring text; bool ok = true; };
@@ -354,7 +355,7 @@ struct Layout {
     int appPickY = 0, appPickH = 0, appPickItemH = 0;
 
     // 设置页
-    int setY = 0, setRowH = 54, setN = 8;
+    int setY = 0, setRowH = 54, setN = 9;
     int setLangTitleY = 0, setLangY = 0, setLangRowH = 38;
     int setHkTitleY = 0, setHkY = 0, setHkRowH = 38;
     int setInfoTitleY = 0, setInfoY = 0;
@@ -536,7 +537,7 @@ inline Layout ComputeLayout(const AppState& st) {
     // 绘制与命中都必须走这几个 y，别在页面里自己加偏移。
     L.setY = L.viewY + pad - L.scroll + L.titleH;
     L.setRowH = SC(54);
-    L.setN = 8;
+    L.setN = 9;
     L.setLangTitleY = L.setY + L.setN * L.setRowH + SC(m.blockGap);
     L.setLangRowH = SC(38);
     L.setLangY = L.setLangTitleY + L.titleH;

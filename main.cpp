@@ -1263,6 +1263,8 @@ struct AppSettings {
   int    ancState    = -1;
   // 音量浮层：Windows 自带 OSD 已够用，默认关
   bool   volOsd      = false;
+  // 窗口置顶：默认关（全屏游戏/视频时不该被压住）
+  bool   alwaysOnTop = false;
 };
 
 static const wchar_t* kRunKey =
@@ -1348,6 +1350,7 @@ static AppSettings LoadSettings() {
       else if (key == "surround3d")    a.surround3D  = atoi(val.c_str());
       else if (key == "anc_state")     a.ancState    = atoi(val.c_str());
       else if (key == "vol_osd")       a.volOsd      = on;
+      else if (key == "always_on_top") a.alwaysOnTop = on;
     }
     fclose(f);
   }
@@ -1384,6 +1387,7 @@ static void SaveSettings(const AppSettings& a) {
           a.directSound ? 1 : 0, a.voiceEnhance ? 1 : 0, a.surround3D);
   fprintf(f, "anc_state=%d\n", a.ancState);
   fprintf(f, "vol_osd=%d\n",   a.volOsd ? 1 : 0);
+  fprintf(f, "always_on_top=%d\n", a.alwaysOnTop ? 1 : 0);
   fclose(f);
 }
 
@@ -1412,6 +1416,7 @@ static AppSettings CurrentSettings() {
   a.surround3D   = g_app.sound.surround3D;
   a.ancState     = g_app.ancState;
   a.volOsd       = g_app.setVolOsd;
+  a.alwaysOnTop  = g_app.setAlwaysOnTop;
   return a;
 }
 
@@ -1432,6 +1437,7 @@ static void ApplySettings(const AppSettings& a) {
   g_app.setHotkeys = a.hotkeys;
   g_hkEnabled = a.hotkeys;
   g_app.setVolOsd = a.volOsd;
+  g_app.setAlwaysOnTop = a.alwaysOnTop;
   // ANC：dongle 无法主动查询，只能靠拨动时的事件上报；先把上次已知状态摆上去，
   // ancAt=1 作为"来自磁盘、不是本次运行同步的"哨兵（UI 据此改措辞）。
   if (a.ancState == 0 || a.ancState == 1) {
@@ -1536,6 +1542,14 @@ static POINT g_dragOffset = {0,0};
 static UINT  g_dpi = 96;
 static DWORD g_tBoot = 0;            // 进程启动时刻（启动性能打点用）
 static int   g_simBattery = -1;      // 调试用：--sim-battery=NN 模拟电量，-1 = 用真实值
+
+// 窗口置顶：WS_EX_TOPMOST 是创建期样式，运行中只能靠 SetWindowPos 切。
+// 默认不置顶 —— 一个音频控制面板没理由压在游戏和视频上面。
+static void ApplyTopMost(bool on) {
+  if (!g_hwnd) return;
+  SetWindowPos(g_hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
 
 // ---------------- 全局快捷键：注册 / 录制 ----------------
 static void HkSay(const std::wstring& msg) { g_hkMsg = msg; g_hkMsgAt = GetTickCount(); }
@@ -3274,10 +3288,10 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
       break;
 
     case eui2::ACT_SET_TOGGLE: {
-      bool* fields[8] = { &g_app.setAutostart, &g_app.setCloseToTray, &g_app.setAutoSwitch,
+      bool* fields[9] = { &g_app.setAutostart, &g_app.setCloseToTray, &g_app.setAutoSwitch,
                           &g_app.setAutoRestore, &g_app.setBattAlert, &g_app.setAppPreset,
-                          &g_app.setHotkeys, &g_app.setVolOsd };
-      if (h.index >= 0 && h.index < 8) {
+                          &g_app.setHotkeys, &g_app.setVolOsd, &g_app.setAlwaysOnTop };
+      if (h.index >= 0 && h.index < 9) {
         bool nv = !*fields[h.index];
         *fields[h.index] = nv;
         switch (h.index) {
@@ -3308,6 +3322,10 @@ static void NewUiOnClick(const eui2::HitInfo& h, POINT p) {
             Log(L"settings: volume osd -> %d (attach=%d)", (int)nv, (int)ok);
             break;
           }
+          case 8:   // 窗口置顶
+            ApplyTopMost(nv);
+            Log(L"settings: always on top -> %d", (int)nv);
+            break;
           default: break;
         }
         SaveSettings(CurrentSettings());
@@ -4349,7 +4367,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR lpCmdLine, int) {
 
   int x = GetSystemMetrics(SM_CXSCREEN) - SW - S(40);
   int y = S(80);
-  g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+  // ★ 不再创建即置顶：默认跟随系统 Z 序，避免挡住全屏游戏/视频。
+  //   需要置顶的人在设置里打开「窗口置顶」（WS_EX_TOPMOST 是创建期样式，
+  //   运行时只能靠 SetWindowPos 切，见 ApplyTopMost）。
+  g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
                            wc.lpszClassName, L"eposwitch",
                            WS_POPUP, x, y, SW, SH,
                            nullptr, nullptr, inst, nullptr);
@@ -4364,6 +4385,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR lpCmdLine, int) {
 
   // 恢复全部设置（语言 + 各开关 + 开机启动状态）
   { AppSettings a = LoadSettings(); ApplySettings(a); }
+  ApplyTopMost(g_app.setAlwaysOnTop);
 
   // EPOS 管道：GSUIPipe 只能有一个 server，官方 UI 开着时我们无法接管
   // ★ 先显示窗口，再做慢初始化。

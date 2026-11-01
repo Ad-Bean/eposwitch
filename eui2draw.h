@@ -1532,7 +1532,7 @@ inline void DrawSettings(Graphics& g, AppState& st) {
         const wchar_t* hzh; const wchar_t* hen;
         bool val;
     };
-    Row rows[8] = {
+    Row rows[9] = {
         { L"开机自动启动", L"Launch at sign-in",
           L"登录 Windows 后自动在托盘运行", L"Start silently in the tray after you sign in",
           st.setAutostart },
@@ -1558,13 +1558,17 @@ inline void DrawSettings(Graphics& g, AppState& st) {
           L"调音量时在右下角弹出提示；Windows 自带的已够用，可关",
           L"Show a card in the corner when volume changes; Windows already has one",
           st.setVolOsd },
+        { L"窗口置顶", L"Always on top",
+          L"让窗口压在其他程序上面；默认关，避免挡住全屏游戏和视频",
+          L"Keep the window above other apps; off by default so it never covers games or video",
+          st.setAlwaysOnTop },
     };
 
-    bool values[8] = { st.setAutostart, st.setCloseToTray, st.setAutoSwitch,
+    bool values[9] = { st.setAutostart, st.setCloseToTray, st.setAutoSwitch,
                        st.setAutoRestore, st.setBattAlert, st.setAppPreset,
-                       st.setHotkeys, st.setVolOsd };
+                       st.setHotkeys, st.setVolOsd, st.setAlwaysOnTop };
 
-    for (int k = 0; k < L.setN && k < 8; k++) {
+    for (int k = 0; k < L.setN && k < 9; k++) {
         int ry = L.setY + k * L.setRowH;
         bool hov = (st.hoverId == CID_ACTION && st.actionHint == ACT_SET_TOGGLE &&
                     st.hoverIndex == k);
