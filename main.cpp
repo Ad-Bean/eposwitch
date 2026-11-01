@@ -1937,40 +1937,49 @@ static void Repaint(HWND hwnd) {
 }
 
 // ---- 托盘图标：环形进度 + 中间数字 ----
+// 托盘里当前要显示的电量：EPOS 优先，耳机不在就取默认输出端点（蓝牙）自带的电量。
+// -1 = 没有任何电量数据，图标画空心。
+static int  g_trayBatt   = -1;
+static bool g_trayActive = false;
+
 static void DrawTrayGlyph(Graphics& g, int SZ) {
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.Clear(Color(0, 0, 0, 0));
 
-    bool online = (g_probe == PROBE_ONLINE);
-    int pct = (g_battery >= 0) ? g_battery : -1;
-    // 有读数就上色（在线按电量区间，过期用琥珀）；完全没数据才用灰
-    Color lc = online ? LevelColor(pct, true)
-             : (pct >= 0 ? C_WARN : Color(255, 0x9A, 0xA3, 0xAD));
+    int pct = g_trayBatt;
+
+    // ★ 扬声器 / 有线耳机没有"电量"这个概念（pct < 0）：
+    //   按用户要求直接画满环绿色（与 100% 完全同款），不引入第二个图标。
+    //   注意语义上它等同于"满电"，只是 tooltip 里不会写电量 —— 这是有意为之的取舍。
+    if (pct < 0) pct = 100;
+
+    bool online = g_trayActive || g_trayBatt < 0;
+    // 有读数就上色（在线按电量区间，过期用琥珀）
+    Color lc = online ? LevelColor(pct, true) : C_WARN;
 
     REAL th = SZ / 7.0f;
     REAL r = (SZ - th) / 2.0f - SZ / 32.0f;
     REAL cx = SZ / 2.0f, cy = SZ / 2.0f;
     RectF rc(cx - r, cy - r, 2 * r, 2 * r);
+    REAL dr = r * 0.42f;
 
     Pen track(Color(online ? 110 : 70, 255, 255, 255), th);
     g.DrawEllipse(&track, rc);
 
-    if (pct > 0) {
+    if (pct >= 100) {
+      // 满环用 DrawEllipse：GDI+ 的 DrawArc 画 360° 在部分驱动上会退化成不画
+      Pen prog(lc, th);
+      g.DrawEllipse(&prog, rc);
+    } else if (pct > 0) {
       Pen prog(lc, th);
       prog.SetStartCap(LineCapRound);
       prog.SetEndCap(LineCapRound);
       g.DrawArc(&prog, rc, -90.0f, 360.0f * pct / 100.0f);
     }
 
-    // 中心状态点：在线/有读数=实心，完全无数据=空心
-    REAL dr = r * 0.42f;
-    if (online || pct >= 0) {
-      SolidBrush sb(lc);
-      g.FillEllipse(&sb, cx - dr, cy - dr, dr * 2, dr * 2);
-    } else {
-      Pen dp(Color(160, 200, 205, 212), SZ / 16.0f);
-      g.DrawEllipse(&dp, cx - dr, cy - dr, dr * 2, dr * 2);
-    }
+    // 中心点：能走到这里说明一定有读数，直接实心
+    SolidBrush sb(lc);
+    g.FillEllipse(&sb, cx - dr, cy - dr, dr * 2, dr * 2);
 }
 
 static HICON MakeTrayIcon() {
@@ -2025,6 +2034,32 @@ static void UpdateTray() {
   }
 
   DWORD t4 = GetTickCount();
+  // 当前默认输出：托盘电量和 tooltip 都要用，先算出来
+  std::wstring curId = g_audio.DefaultId(eConsole);
+  std::wstring curName = L"(无)";
+  for (auto& e : g_eps) if (e.id == curId) curName = e.name;
+
+  // 托盘图标电量：EPOS 有读数就用它；否则用当前默认输出端点的电量（蓝牙耳机/音箱）
+  g_trayBatt = -1;
+  g_trayActive = false;
+  if (g_battery >= 0) {
+    g_trayBatt = g_battery;
+    g_trayActive = (g_probe == PROBE_ONLINE);
+  } else {
+    for (auto& e : g_eps)
+      if (e.id == curId && e.batt >= 0) { g_trayBatt = e.batt; g_trayActive = true; break; }
+  }
+
+  // 只在电量来源/数值变化时记一行，便于排查"托盘没显示电量"
+  {
+    static int lastBatt = -2; static bool lastAct = false;
+    if (g_trayBatt != lastBatt || g_trayActive != lastAct) {
+      lastBatt = g_trayBatt; lastAct = g_trayActive;
+      Log(L"tray: battery=%d active=%d src=%ls", g_trayBatt, (int)g_trayActive,
+          g_battery >= 0 ? L"epos" : L"endpoint");
+    }
+  }
+
   HICON ic = MakeTrayIcon();
   DWORD t5 = GetTickCount();
   NOTIFYICONDATAW nid = {};
@@ -2036,13 +2071,14 @@ static void UpdateTray() {
   nid.hIcon = ic;
 
   std::wstring tip = L"音频控制台\n";
-  std::wstring curName = L"(无)";
-  std::wstring curId = g_audio.DefaultId(eConsole);
-  for (auto& e : g_eps) if (e.id == curId) curName = e.name;
-
   if (g_battery >= 0) {
     wchar_t b[64];
     swprintf(b, 64, L"EPOS 电量 %d%%\n", g_battery);
+    tip += b;
+  } else if (g_trayBatt >= 0) {
+    // 蓝牙耳机：电量来自 HFP 节点属性（和 Windows 设置页同源）
+    wchar_t b[64];
+    swprintf(b, 64, L"电量 %d%%\n", g_trayBatt);
     tip += b;
   }
   tip += L"输出: " + curName;
