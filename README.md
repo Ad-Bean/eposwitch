@@ -13,6 +13,8 @@ executable, no installer, no driver, no runtime dependencies.
   like NVIDIA Broadcast, grouped separately), switch the default device with one click,
   per-device volume slider and mute.
 - **Volume mixer** — per-application volume and mute (`IAudioSessionManager2`).
+- **Wheel over any slider** — overview (speaker + mic), devices and mixer sliders all
+  respond to the mouse wheel, 5% per notch, delta-scaled for high-resolution wheels.
 - **EQ & effects** — 9-band speaker/mic EQ, reverb, noise gate, sidetone, 3D surround,
   voice enhance; factory + custom presets, applied through the same APO channel the
   official app uses.
@@ -25,11 +27,15 @@ executable, no installer, no driver, no runtime dependencies.
   the system volume changes. Off by default (Windows already has one).
 - **Global hotkeys** — configurable/rebindable (cycle output, mute, cycle EQ preset),
   with a master on/off switch.
-- **Bluetooth battery** — headset battery % read from the HFP device node
-  (same source as the Windows Settings page; works for classic-BT headsets
-  that don't expose GATT).
+- **Battery in the tray** — the tray icon's ring shows the current headset's level,
+  sourced from the EPOS pipe when the headset is on, otherwise from the default
+  output endpoint. Bluetooth battery is read from the HFP device node (same source as
+  the Windows Settings page; works for classic-BT headsets that don't expose GATT).
+  Endpoints with no battery concept (motherboard DAC, wired headsets) draw a full
+  ring rather than an empty one.
 - **Extras** — low-battery notifications, auto-switch on headset connect, restore on
-  reconnect, autostart, tray mode, Chinese/English UI, crash logging.
+  reconnect, autostart, tray mode, optional always-on-top (off by default), optional
+  volume overlay, Chinese/English UI, crash logging.
 
 ## Build
 
